@@ -26,7 +26,7 @@ This is a fork of [Microsoft TRELLIS](https://github.com/microsoft/TRELLIS) modi
 
 ```bash
 # Clone the repository
-git clone https://github.com/YOUR_USERNAME/TRELLIS-AMD
+git clone https://github.com/CalebisGross/TRELLIS-AMD
 cd TRELLIS-AMD
 
 # Run the installation script
@@ -48,6 +48,7 @@ Then open http://localhost:7860 in your browser.
 - Modified kernel entry points to use simplified implementation
 
 ### diff-gaussian-rasterization Modifications
+- **Manual HIP build** via `build_hip.sh` (bypasses broken CUDAExtension)
 - Fixed `DuplicateWithKeys` kernel buffer initialization
 - Fixed C++ ABI compatibility for ROCm PyTorch
 
