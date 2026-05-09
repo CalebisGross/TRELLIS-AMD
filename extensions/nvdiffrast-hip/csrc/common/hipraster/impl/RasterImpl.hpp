@@ -35,7 +35,18 @@ public:
     size_t                  getTotalBufferSizes     (void) const;
 
 private:
-    void                    launchStages            (bool instanceMode, bool peel, hipStream_t stream);
+    void                    launchStages            (bool instanceMode, bool peel, hipStream_t stream, int stageSet);
+
+    // Per-instance device CRParams buffer (avoids sharing static pointer across instances).
+    void*                   m_d_crParams;
+    hipStream_t             m_stream2;              // Second stream for coarse+fine (AMD multi-dispatch workaround).
+    int                     m_drawCount;            // Per-instance draw call counter for diagnostics.
+
+    // HIP Graph: captures all 4 kernel launches into a single graph execution.
+    // Bypasses buggy individual hipLaunchKernel path on RDNA3/ROCm.
+    hipGraphExec_t          m_graphExec;
+    int                     m_graphNumTriangles;    // Cache key: recreate graph if changed.
+    int                     m_graphNumImages;       // Cache key: recreate graph if changed.
 
     // State.
 
@@ -90,6 +101,8 @@ private:
     Buffer                  m_tileSegData;
     Buffer                  m_tileSegNext;
     Buffer                  m_tileSegCount;
+    Buffer                  m_warpEmitGlobal;       // CoarseGlobalScratch[numImages * numCoarseBlocks]: warpEmitMask+PrefixSum moved out of LDS
+    HostBuffer              m_debugTrace;           // 64 * S32 in pinned host memory: kernel writes via PCIe, visible even after GPU fault
 
     // Actual buffer sizes.
 

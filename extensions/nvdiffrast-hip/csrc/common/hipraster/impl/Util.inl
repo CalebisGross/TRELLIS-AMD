@@ -496,11 +496,6 @@ template <class T> __device__ __inline__ void sortShared(T *ptr, int numItems) {
   int thrInBlock = threadIdx.x + threadIdx.y * blockDim.x;
   int range = 16;
 
-  // DEBUG: Track entry
-  if (thrInBlock == 0 && blockIdx.x == 0)
-    printf("[sortShared] ENTER: numItems=%d, blockDim=(%d,%d)\n", numItems,
-           blockDim.x, blockDim.y);
-
   int base = thrInBlock * 2;
   bool act = (base < numItems - 1);
   // Note: __ballot without mask is HIP's version
@@ -538,10 +533,6 @@ template <class T> __device__ __inline__ void sortShared(T *ptr, int numItems) {
   if (act) {
     ptr[base + 1] = mid;
   }
-
-  // DEBUG: First loop completed
-  if (thrInBlock == 0 && blockIdx.x == 0)
-    printf("[sortShared] First loop completed, entering second loop\n");
 
   for (; range < numItems; range <<= 1) {
     __syncthreads();

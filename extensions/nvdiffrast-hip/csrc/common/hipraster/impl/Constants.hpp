@@ -34,8 +34,8 @@
 #define CR_SETUP_WARPS          2
 #define CR_SETUP_OPT_BLOCKS     8
 #define CR_BIN_WARPS            16
-#define CR_COARSE_WARPS         16      // Must be a power of two.
-#define CR_FINE_MAX_WARPS       20
+#define CR_COARSE_WARPS         8
+#define CR_FINE_MAX_WARPS       12
 
 #define CR_EMBED_IMAGE_PARAMS   32      // Number of per-image parameter structs embedded in kernel launch parameter block.
 

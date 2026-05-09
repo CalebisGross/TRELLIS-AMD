@@ -174,18 +174,20 @@ __device__ __inline__ void executeROP(U32 color, U32 depth, volatile U32* pColor
 
 //------------------------------------------------------------------------
 
-__device__ __inline__ void fineRasterImpl(const CRParams p)
+__device__ __inline__ void fineRasterImpl(const CRParams& p, char* s_smem)
 {
-                                                                            // for 20 warps:
-    __shared__ volatile U64 s_cover8x8_lut[CR_COVER8X8_LUT_SIZE];           // 6KB
-    __shared__ volatile U32 s_tileColor   [CR_FINE_MAX_WARPS][CR_TILE_SQR]; // 5KB
-    __shared__ volatile U32 s_tileDepth   [CR_FINE_MAX_WARPS][CR_TILE_SQR]; // 5KB
-    __shared__ volatile U32 s_tilePeel    [CR_FINE_MAX_WARPS][CR_TILE_SQR]; // 5KB
-    __shared__ volatile U32 s_triDataIdx  [CR_FINE_MAX_WARPS][64];          // 5KB  CRTriangleData index
-    __shared__ volatile U64 s_triangleCov [CR_FINE_MAX_WARPS][64];          // 10KB coverage mask
-    __shared__ volatile U32 s_triangleFrag[CR_FINE_MAX_WARPS][64];          // 5KB  fragment index
-    __shared__ volatile U32 s_temp        [CR_FINE_MAX_WARPS][80];          // 6.25KB
-                                                                            // = 47.25KB total
+    return; // SAFE-MODE: pair with coarseRaster's safe-mode. Bisect (Test 75) showed bug is in coarse, not fine.
+    FineSmem& smem = *(FineSmem*)s_smem;
+
+    // Alias struct members to original variable names so code below is unchanged.
+    volatile U64 (&s_cover8x8_lut)[CR_COVER8X8_LUT_SIZE] = smem.cover8x8_lut;
+    volatile U32 (&s_tileColor)[CR_FINE_MAX_WARPS][CR_TILE_SQR] = smem.tileColor;
+    volatile U32 (&s_tileDepth)[CR_FINE_MAX_WARPS][CR_TILE_SQR] = smem.tileDepth;
+    volatile U32 (&s_tilePeel)[CR_FINE_MAX_WARPS][CR_TILE_SQR] = smem.tilePeel;
+    volatile U32 (&s_triDataIdx)[CR_FINE_MAX_WARPS][64] = smem.triDataIdx;
+    volatile U64 (&s_triangleCov)[CR_FINE_MAX_WARPS][64] = smem.triangleCov;
+    volatile U32 (&s_triangleFrag)[CR_FINE_MAX_WARPS][64] = smem.triangleFrag;
+    volatile U32 (&s_temp)[CR_FINE_MAX_WARPS][80] = smem.temp;
 
     CRAtomics&            atomics   = p.atomics[blockIdx.z];
     const CRTriangleData* triData   = (const CRTriangleData*)p.triData + blockIdx.z * p.maxSubtris;

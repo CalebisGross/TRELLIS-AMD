@@ -13,7 +13,11 @@
 #define __any_sync(mask, predicate) __any(predicate)
 #endif
 #ifndef __syncwarp
-#define __syncwarp(...) __threadfence_block()
+// Use the AMDGCN wave-barrier intrinsic instead of just a memory fence: this
+// actually waits for all wave threads to converge, matching the original
+// NVIDIA __syncwarp() semantics. The mask argument is ignored (AMD waves work
+// at the wavefront level; partial-wave masks aren't a primitive).
+#define __syncwarp(...) __builtin_amdgcn_wave_barrier()
 #endif
 
 // Copyright (c) 2009-2022, NVIDIA CORPORATION.  All rights reserved.
@@ -39,19 +43,44 @@ namespace CR
 #include "TriangleSetup.inl"
 #include "BinRaster.inl"
 #include "CoarseRaster.inl"
-#include "CoarseRasterSimple.inl"  // AMD HIP-compatible simplified version
 #include "FineRaster.inl"
 
 }
 
 //------------------------------------------------------------------------
 // Stage entry points.
+// AMD RDNA3/ROCm 6.4 workaround: Dispatching 3+ different kernel functions
+// causes GPU memory faults. Merge into 2 unified kernels, each handling 2
+// stages via a parameter. Each kernel dispatched twice = 4 total dispatches.
 //------------------------------------------------------------------------
 
-__global__ void __launch_bounds__(CR_SETUP_WARPS * 32, CR_SETUP_OPT_BLOCKS)  triangleSetupKernel (const CR::CRParams p)  { CR::triangleSetupImpl(p); }
-__global__ void __launch_bounds__(CR_BIN_WARPS * 32, 1)                      binRasterKernel     (const CR::CRParams p)  { CR::binRasterImpl(p); }
-// AMD HIP FIX: Use simplified coarse raster that doesn't use warp-level sync
-__global__ void __launch_bounds__(CR_COARSE_WARPS * 32, 1)                   coarseRasterKernel  (const CR::CRParams p)  { CR::coarseRasterImplSimple(p); }
-__global__ void __launch_bounds__(CR_FINE_MAX_WARPS * 32, 1)                 fineRasterKernel    (const CR::CRParams p)  { CR::fineRasterImpl(p); }
+// setupKernel: stage 0 = triangleSetup, stage 1 = binRaster
+// launch_bounds must accommodate the larger of the two (binRaster = 512 threads)
+__global__ void __launch_bounds__(CR_BIN_WARPS * 32, 1)
+setupKernel(const CR::CRParams* p, int stage)
+{
+    if (stage == 0) CR::triangleSetupImpl(*p);
+    else            CR::binRasterImpl(*p);
+}
+
+// rasterKernel: stage 0 = coarseRaster, stage 1 = fineRaster
+// launch_bounds must accommodate the LARGER of (CR_COARSE_WARPS, CR_FINE_MAX_WARPS)
+// since the same kernel handles both stages with different launch dims.
+// AMD RDNA3 workaround: static __shared__ instead of dynamic extern __shared__.
+// Dynamic shared memory (~47KB) causes GPU memory faults on RDNA3/ROCm (Test 51).
+// minBlocksPerSM=2: rocm7's hipcc generates kernels with very high register
+// usage (230 regs/thread observed). Without the hint the compiler doesn't
+// budget for occupancy and the launch fails with hipErrorLaunchOutOfResources.
+__global__ void __launch_bounds__((CR_COARSE_WARPS > CR_FINE_MAX_WARPS ? CR_COARSE_WARPS : CR_FINE_MAX_WARPS) * 32, 2)
+rasterKernel(const CR::CRParams* p, int stage)
+{
+    // Tests 55-59 were stale-binary false PASSes. After clean rebuild:
+    // 40KB and 48KB both give coarseBlocks=1 (occupancy 1 block/SM) and CRASH.
+    // 32KB gives coarseBlocks=2 (occupancy 2 blocks/SM) and PASSES.
+    // Threshold is the 32KB / 64KB-per-SM split, not the kernel size itself.
+    __shared__ char s_smem[32768];
+    if (stage == 0) CR::coarseRasterImpl(*p, s_smem);
+    else            CR::fineRasterImpl(*p, s_smem);
+}
 
 //------------------------------------------------------------------------

@@ -13,6 +13,8 @@
 #include "../../hipraster/impl/PrivateDefs.hpp"
 #include "../../hipraster/impl/RasterImpl.hpp"
 #include <hip/hip_runtime.h>
+#include <iostream>
+#include <unistd.h>
 
 using namespace CR;
 using std::max;
@@ -21,10 +23,10 @@ using std::min;
 //------------------------------------------------------------------------
 // Kernel prototypes and variables.
 
-void triangleSetupKernel(const CRParams p);
-void binRasterKernel(const CRParams p);
-void coarseRasterKernel(const CRParams p);
-void fineRasterKernel(const CRParams p);
+// AMD RDNA3 workaround: 2 unified kernels instead of 4 separate ones.
+// Dispatching 3+ different kernel functions crashes on RDNA3/ROCm 6.4.
+void setupKernel(const CRParams* p, int stage);   // stage 0=triSetup, 1=binRaster
+void rasterKernel(const CRParams* p, int stage);  // stage 0=coarseRaster, 1=fineRaster
 
 //------------------------------------------------------------------------
 
@@ -32,6 +34,9 @@ RasterImpl::RasterImpl(void)
     : m_renderModeFlags(0), m_deferredClear(false), m_clearColor(0),
       m_vertexPtr(NULL), m_indexPtr(NULL), m_numVertices(0), m_numTriangles(0),
       m_bufferSizesReported(0),
+
+      m_d_crParams(NULL), m_stream2(NULL), m_drawCount(0),
+      m_graphExec(NULL), m_graphNumTriangles(0), m_graphNumImages(0), // unused but kept in header
 
       m_numImages(0), m_bufferSizePixels(0, 0), m_bufferSizeVp(0, 0),
       m_sizePixels(0, 0), m_sizeVp(0, 0), m_offsetPixels(0, 0),
@@ -47,33 +52,60 @@ RasterImpl::RasterImpl(void)
   NVDR_CHECK_CUDA_ERROR(hipGetDevice(&currentDevice));
   NVDR_CHECK_CUDA_ERROR(hipDeviceGetAttribute(
       &m_numSMs, hipDeviceAttributeMultiprocessorCount, currentDevice));
+  // Query attributes from rasterKernel (handles both coarse and fine stages).
   hipFuncAttributes attr;
   NVDR_CHECK_CUDA_ERROR(hipFuncGetAttributes(
-      &attr, reinterpret_cast<const void *>(fineRasterKernel)));
+      &attr, reinterpret_cast<const void *>(rasterKernel)));
   m_numFineWarpsPerBlock = min(attr.maxThreadsPerBlock / 32, CR_FINE_MAX_WARPS);
+  // Static shared memory in kernel -- pass 0 for dynamic smem in occupancy queries.
   NVDR_CHECK_CUDA_ERROR(hipOccupancyMaxActiveBlocksPerMultiprocessor(
-      &m_numCoarseBlocksPerSM, (void *)coarseRasterKernel, 32 * CR_COARSE_WARPS,
+      &m_numCoarseBlocksPerSM, (void *)rasterKernel, 32 * CR_COARSE_WARPS,
       0));
   NVDR_CHECK_CUDA_ERROR(hipOccupancyMaxActiveBlocksPerMultiprocessor(
-      &m_numFineBlocksPerSM, (void *)fineRasterKernel,
+      &m_numFineBlocksPerSM, (void *)rasterKernel,
       32 * m_numFineWarpsPerBlock, 0));
 
   // Setup functions.
 
-  NVDR_CHECK_CUDA_ERROR(hipFuncSetCacheConfig((void *)triangleSetupKernel,
+  NVDR_CHECK_CUDA_ERROR(hipFuncSetCacheConfig((void *)setupKernel,
                                               hipFuncCachePreferShared));
-  NVDR_CHECK_CUDA_ERROR(
-      hipFuncSetCacheConfig((void *)binRasterKernel, hipFuncCachePreferShared));
-  NVDR_CHECK_CUDA_ERROR(hipFuncSetCacheConfig((void *)coarseRasterKernel,
+  NVDR_CHECK_CUDA_ERROR(hipFuncSetCacheConfig((void *)rasterKernel,
                                               hipFuncCachePreferShared));
-  NVDR_CHECK_CUDA_ERROR(hipFuncSetCacheConfig((void *)fineRasterKernel,
-                                              hipFuncCachePreferShared));
+
+  // AMD multi-dispatch workaround: create second stream for coarse+fine raster.
+  // Dispatching 3+ different kernels on the same stream crashes on RDNA3/ROCm 6.4.
+  NVDR_CHECK_CUDA_ERROR(hipStreamCreate(&m_stream2));
+
+  int maxSmemPerBlock = 0;
+  NVDR_CHECK_CUDA_ERROR(hipDeviceGetAttribute(
+      &maxSmemPerBlock, hipDeviceAttributeMaxSharedMemoryPerBlock, currentDevice));
+  std::cerr << "[RasterImpl ctor @" << (void*)this << "] dev=" << currentDevice
+            << " maxSmemPerBlock=" << maxSmemPerBlock
+            << " SMs=" << m_numSMs
+            << " coarseBlocks=" << m_numCoarseBlocksPerSM
+            << " fineBlocks=" << m_numFineBlocksPerSM
+            << " fineWarps=" << m_numFineWarpsPerBlock
+            << " regsPerThread=" << attr.numRegs
+            << " smemPerBlock=" << attr.sharedSizeBytes
+            << " d_crParams=" << m_d_crParams
+            << std::endl;
 }
 
 //------------------------------------------------------------------------
 
 RasterImpl::~RasterImpl(void) {
-  // Empty.
+  if (m_graphExec) {
+    hipGraphExecDestroy(m_graphExec);
+    m_graphExec = NULL;
+  }
+  if (m_stream2) {
+    hipStreamDestroy(m_stream2);
+    m_stream2 = NULL;
+  }
+  if (m_d_crParams) {
+    hipFree(m_d_crParams);
+    m_d_crParams = NULL;
+  }
 }
 
 //------------------------------------------------------------------------
@@ -191,6 +223,17 @@ bool RasterImpl::drawTriangles(const Vec2i *ranges, bool peel,
     m_tileSegNext.reset(m_numImages * m_maxTileSegs * sizeof(S32));
     m_tileSegCount.reset(m_numImages * m_maxTileSegs * sizeof(S32));
 
+    // AMD RDNA3: warpEmitMask + warpEmitPrefixSum live in global memory, one
+    // CoarseGlobalScratch slot per (image, coarse-block).
+    int numCoarseBlocks = m_numSMs * m_numCoarseBlocksPerSM;
+    m_warpEmitGlobal.reset(m_numImages * numCoarseBlocks *
+                           sizeof(CR::CoarseGlobalScratch));
+
+    // Diagnostic trace buffer: 64 S32 slots in host-pinned memory. Kernel
+    // writes go directly via PCIe so they survive a GPU fault. Zero-init.
+    m_debugTrace.grow(64 * sizeof(S32));
+    memset(m_debugTrace.getPtr(), 0, 64 * sizeof(S32));
+
     // Report if buffers grow from last time.
     size_t sizesTotal = getTotalBufferSizes();
     if (sizesTotal > m_bufferSizesReported) {
@@ -201,8 +244,16 @@ bool RasterImpl::drawTriangles(const Vec2i *ranges, bool peel,
       m_bufferSizesReported = sizesMB << 20;
     }
 
-    // Launch stages. Blocks until everything is done.
-    launchStages(instanceMode, peel, stream);
+    // AMD RDNA3 workaround: split into two launchStages calls (max 2 dispatches each).
+    // 3+ kernel dispatches per call crashes on RDNA3/ROCm. Test 38 showed 2 dispatches
+    // per call is stable across 120+ frames. The full host-side round-trip between calls
+    // resets whatever runtime state triggers the crash.
+    if (!peel) {
+      launchStages(instanceMode, false, stream, 0); // triSetup + binRaster
+      launchStages(instanceMode, false, stream, 1); // coarseRaster + fineRaster
+    } else {
+      launchStages(instanceMode, true, stream, 2);  // fineRaster only (peel)
+    }
 
     // Peeling iteration cannot fail, so no point checking things further.
     if (peel)
@@ -210,6 +261,25 @@ bool RasterImpl::drawTriangles(const Vec2i *ranges, bool peel,
 
     // Atomics after coarse stage are now available.
     CRAtomics *atomics = (CRAtomics *)m_crAtomicsHost.getPtr();
+
+    // Diagnostic: log atomics on first few draws per instance, and always when zero output.
+    m_drawCount++;
+    for (int i = 0; i < m_numImages; i++) {
+      const CRAtomics &a = atomics[i];
+      if (m_drawCount <= 3 || a.numActiveTiles == 0) {
+        std::cerr << "[drawTriangles @" << (void*)this
+                  << " #" << m_drawCount << " img" << i << "] "
+                  << "subtris=" << a.numSubtris
+                  << " binSegs=" << a.numBinSegs
+                  << " tileSegs=" << a.numTileSegs
+                  << " activeTiles=" << a.numActiveTiles
+                  << " tris=" << m_numTriangles
+                  << " vp=" << m_sizeVp.x << "x" << m_sizeVp.y
+                  << " tiles=" << m_numTiles
+                  << " bins=" << m_numBins
+                  << std::endl;
+      }
+    }
 
     // Success?
     bool failed = false;
@@ -249,53 +319,45 @@ size_t RasterImpl::getTotalBufferSizes(void) const {
          m_binSegData.getSize() + m_binSegNext.getSize() +
          m_binSegCount.getSize() + m_activeTiles.getSize() +
          m_tileFirstSeg.getSize() + m_tileSegData.getSize() +
-         m_tileSegNext.getSize() + m_tileSegCount.getSize();
+         m_tileSegNext.getSize() + m_tileSegCount.getSize() +
+         m_warpEmitGlobal.getSize();
 }
 
 //------------------------------------------------------------------------
 
+// stageSet: 0 = setup (triSetup + binRaster), 1 = raster (coarseRaster + fineRaster), 2 = peel (fineRaster only)
+// AMD RDNA3 workaround: max 2 dispatches per call. drawTriangles calls this twice for non-peel.
 void RasterImpl::launchStages(bool instanceMode, bool peel,
-                              hipStream_t stream) {
+                              hipStream_t stream, int stageSet) {
   CRImageParams *imageParams = (CRImageParams *)m_crImageParamsHost.getPtr();
 
-  // Unless peeling, initialize atomics to mostly zero.
+  // Atomics init only on stageSet 0 (first call of the pair).
   CRAtomics *atomics = (CRAtomics *)m_crAtomicsHost.getPtr();
-  if (!peel) {
+  if (stageSet == 0) {
     memset(atomics, 0, m_numImages * sizeof(CRAtomics));
     for (int i = 0; i < m_numImages; i++)
       atomics[i].numSubtris = imageParams[i].triCount;
+    NVDR_CHECK_CUDA_ERROR(hipMemcpyAsync(m_crAtomics.getPtr(), atomics,
+                                         m_numImages * sizeof(CRAtomics),
+                                         hipMemcpyHostToDevice, stream));
+  } else if (stageSet == 2) {
+    // Peel: upload atomics without reinit.
+    NVDR_CHECK_CUDA_ERROR(hipMemcpyAsync(m_crAtomics.getPtr(), atomics,
+                                         m_numImages * sizeof(CRAtomics),
+                                         hipMemcpyHostToDevice, stream));
   }
 
-  // Copy to device. If peeling, this is the state after coarse raster launch on
-  // first iteration.
-  NVDR_CHECK_CUDA_ERROR(hipMemcpyAsync(m_crAtomics.getPtr(), atomics,
-                                       m_numImages * sizeof(CRAtomics),
-                                       hipMemcpyHostToDevice, stream));
-
-  // Copy per-image parameters if there are more than fits in launch parameter
-  // block and we haven't done it already.
-  if (!peel && m_numImages > CR_EMBED_IMAGE_PARAMS) {
-    int numImageParamsExtra = m_numImages - CR_EMBED_IMAGE_PARAMS;
-    m_crImageParamsExtra.grow(numImageParamsExtra * sizeof(CRImageParams));
-    NVDR_CHECK_CUDA_ERROR(hipMemcpyAsync(
-        m_crImageParamsExtra.getPtr(), imageParams + CR_EMBED_IMAGE_PARAMS,
-        numImageParamsExtra * sizeof(CRImageParams), hipMemcpyHostToDevice,
-        stream));
-  }
-
-  // Set global parameters.
+  // Build CRParams and upload to device.
   CRParams p;
   {
     p.atomics = (CRAtomics *)m_crAtomics.getPtr();
     p.numImages = m_numImages;
-    p.totalCount = 0; // Only relevant in range mode.
+    p.totalCount = 0;
     p.instanceMode = instanceMode ? 1 : 0;
-
     p.numVertices = m_numVertices;
     p.numTriangles = m_numTriangles;
     p.vertexBuffer = m_vertexPtr;
     p.indexBuffer = m_indexPtr;
-
     p.widthPixels = m_sizePixels.x;
     p.heightPixels = m_sizePixels.y;
     p.widthPixelsVp = m_sizeVp.x;
@@ -303,27 +365,22 @@ void RasterImpl::launchStages(bool instanceMode, bool peel,
     p.widthBins = m_sizeBins.x;
     p.heightBins = m_sizeBins.y;
     p.numBins = m_numBins;
-
     p.xs = (float)m_bufferSizeVp.x / (float)m_sizeVp.x;
     p.ys = (float)m_bufferSizeVp.y / (float)m_sizeVp.y;
     p.xo = (float)(m_bufferSizeVp.x - m_sizeVp.x - 2 * m_offsetPixels.x) /
            (float)m_sizeVp.x;
     p.yo = (float)(m_bufferSizeVp.y - m_sizeVp.y - 2 * m_offsetPixels.y) /
            (float)m_sizeVp.y;
-
     p.widthTiles = m_sizeTiles.x;
     p.heightTiles = m_sizeTiles.y;
     p.numTiles = m_numTiles;
-
     p.renderModeFlags = m_renderModeFlags;
     p.deferredClear = m_deferredClear ? 1 : 0;
     p.clearColor = m_clearColor;
     p.clearDepth = CR_DEPTH_MAX;
-
     p.maxSubtris = m_maxSubtris;
     p.maxBinSegs = m_maxBinSegs;
     p.maxTileSegs = m_maxTileSegs;
-
     p.triSubtris = m_triSubtris.getPtr();
     p.triHeader = m_triHeader.getPtr();
     p.triData = m_triData.getPtr();
@@ -337,7 +394,8 @@ void RasterImpl::launchStages(bool instanceMode, bool peel,
     p.tileSegCount = m_tileSegCount.getPtr();
     p.activeTiles = m_activeTiles.getPtr();
     p.tileFirstSeg = m_tileFirstSeg.getPtr();
-
+    p.warpEmitGlobal = m_warpEmitGlobal.getPtr();
+    p.debugTrace = m_debugTrace.getPtr();
     size_t byteOffset =
         ((size_t)m_offsetPixels.x +
          (size_t)m_offsetPixels.y * (size_t)m_bufferSizePixels.x) *
@@ -350,85 +408,84 @@ void RasterImpl::launchStages(bool instanceMode, bool peel,
             : 0;
     p.strideX = m_bufferSizePixels.x;
     p.strideY = m_bufferSizePixels.y;
-
     memcpy(&p.imageParamsFirst, imageParams,
            min(m_numImages, CR_EMBED_IMAGE_PARAMS) * sizeof(CRImageParams));
     p.imageParamsExtra = (CRImageParams *)m_crImageParamsExtra.getPtr();
   }
 
-  // Setup block sizes.
+  CRParams* d_crParams = (CRParams*)m_d_crParams;
+  if (!d_crParams) {
+    NVDR_CHECK_CUDA_ERROR(hipMalloc(&d_crParams, sizeof(CRParams)));
+    m_d_crParams = d_crParams;
+  }
+  NVDR_CHECK_CUDA_ERROR(hipMemcpyAsync(d_crParams, &p, sizeof(CRParams),
+                                       hipMemcpyHostToDevice, stream));
 
-  dim3 brBlock(32, CR_BIN_WARPS);
-  dim3 crBlock(32, CR_COARSE_WARPS);
-  dim3 frBlock(32, m_numFineWarpsPerBlock);
-  void *args[] = {&p};
-
-  std::cerr << "[nvdiffrast] Starting rasterization, peel=" << peel
-            << ", numTriangles=" << m_numTriangles
-            << ", numImages=" << m_numImages << std::endl;
-
-  // Launch stages from setup to coarse and copy atomics to host only if this is
-  // not a single-tile peeling iteration.
-  if (!peel) {
-    if (instanceMode) {
-      int setupBlocks = (m_numTriangles - 1) / (32 * CR_SETUP_WARPS) + 1;
-      std::cerr << "[nvdiffrast] Launching triangleSetupKernel: blocks="
-                << setupBlocks << std::endl;
-      NVDR_CHECK_CUDA_ERROR(hipLaunchKernel(
-          (void *)triangleSetupKernel, dim3(setupBlocks, 1, m_numImages),
-          dim3(32, CR_SETUP_WARPS), args, 0, stream));
-      hipDeviceSynchronize();
-      std::cerr << "[nvdiffrast] triangleSetupKernel completed" << std::endl;
-    } else {
-      for (int i = 0; i < m_numImages; i++)
-        p.totalCount += imageParams[i].triCount;
-      int setupBlocks = (p.totalCount - 1) / (32 * CR_SETUP_WARPS) + 1;
-      std::cerr << "[nvdiffrast] Launching triangleSetupKernel (non-instance): "
-                   "blocks="
-                << setupBlocks << ", totalCount=" << p.totalCount << std::endl;
-      NVDR_CHECK_CUDA_ERROR(
-          hipLaunchKernel((void *)triangleSetupKernel, dim3(setupBlocks, 1, 1),
-                          dim3(32, CR_SETUP_WARPS), args, 0, stream));
-      hipDeviceSynchronize();
-      std::cerr << "[nvdiffrast] triangleSetupKernel completed" << std::endl;
-    }
-
-    std::cerr << "[nvdiffrast] Launching binRasterKernel" << std::endl;
+  if (stageSet == 0) {
+    // Setup batch: triSetup + binRaster (2 dispatches).
+    int stage0 = 0;
+    void *argsS0[] = {&d_crParams, &stage0};
     NVDR_CHECK_CUDA_ERROR(hipLaunchKernel(
-        (void *)binRasterKernel, dim3(CR_BIN_STREAMS_SIZE, 1, m_numImages),
-        brBlock, args, 0, stream));
-    hipDeviceSynchronize();
-    std::cerr << "[nvdiffrast] binRasterKernel completed" << std::endl;
+        (void *)setupKernel,
+        dim3((m_numTriangles - 1) / (CR_SETUP_WARPS * 32) + 1, 1, m_numImages),
+        dim3(32, CR_SETUP_WARPS), argsS0, 0, stream));
 
-    std::cerr
-        << "[nvdiffrast] Launching coarseRasterKernel (simplified AMD): SMs="
-        << m_numSMs << ", blocksPerSM=" << m_numCoarseBlocksPerSM << std::endl;
-    // AMD HIP FIX: Now uses coarseRasterImplSimple which avoids warp-level sync
-    NVDR_CHECK_CUDA_ERROR(
-        hipLaunchKernel((void *)coarseRasterKernel,
-                        dim3(m_numSMs * m_numCoarseBlocksPerSM, 1, m_numImages),
-                        crBlock, args, 0, stream));
-    hipDeviceSynchronize();
-    std::cerr << "[nvdiffrast] coarseRasterKernel completed" << std::endl;
+    int stage1 = 1;
+    void *argsS1[] = {&d_crParams, &stage1};
+    NVDR_CHECK_CUDA_ERROR(hipLaunchKernel(
+        (void *)setupKernel, dim3(CR_BIN_STREAMS_SIZE, 1, m_numImages),
+        dim3(32, CR_BIN_WARPS), argsS1, 0, stream));
 
+  } else if (stageSet == 1) {
+    // Raster batch: coarseRaster + fineRaster (2 dispatches of rasterKernel).
+    // Static shared memory in kernel -- no dynamic smem needed (0 bytes).
+    int stage0 = 0;
+    void *argsR0[] = {&d_crParams, &stage0};
+    NVDR_CHECK_CUDA_ERROR(hipLaunchKernel(
+        (void *)rasterKernel,
+        dim3(m_numSMs * m_numCoarseBlocksPerSM, 1, m_numImages),
+        dim3(32, CR_COARSE_WARPS), argsR0, 0, stream));
+
+    int stage1 = 1;
+    void *argsR1[] = {&d_crParams, &stage1};
+    NVDR_CHECK_CUDA_ERROR(hipLaunchKernel(
+        (void *)rasterKernel,
+        dim3(m_numSMs * m_numFineBlocksPerSM, 1, m_numImages),
+        dim3(32, m_numFineWarpsPerBlock), argsR1, 0, stream));
+
+  } else {
+    // Peel: fineRaster only (1 dispatch). Static smem, 0 dynamic.
+    int stage1 = 1;
+    void *argsR1[] = {&d_crParams, &stage1};
+    NVDR_CHECK_CUDA_ERROR(hipLaunchKernel(
+        (void *)rasterKernel,
+        dim3(m_numSMs * m_numFineBlocksPerSM, 1, m_numImages),
+        dim3(32, m_numFineWarpsPerBlock), argsR1, 0, stream));
+  }
+
+  // Copy atomics back after raster batch (stageSet 1) for overflow detection.
+  if (stageSet == 1) {
     NVDR_CHECK_CUDA_ERROR(hipMemcpyAsync(
         m_crAtomicsHost.getPtr(), m_crAtomics.getPtr(),
         sizeof(CRAtomics) * m_numImages, hipMemcpyDeviceToHost, stream));
   }
 
-  // Fine rasterizer is launched always.
-  std::cerr << "[nvdiffrast] Launching fineRasterKernel: SMs=" << m_numSMs
-            << ", blocksPerSM=" << m_numFineBlocksPerSM
-            << ", warpsPerBlock=" << m_numFineWarpsPerBlock << std::endl;
-  NVDR_CHECK_CUDA_ERROR(
-      hipLaunchKernel((void *)fineRasterKernel,
-                      dim3(m_numSMs * m_numFineBlocksPerSM, 1, m_numImages),
-                      frBlock, args, 0, stream));
-  std::cerr << "[nvdiffrast] Waiting for fineRasterKernel..." << std::endl;
+  // Print diagnostic trace BEFORE sync. Host-pinned memory means kernel writes
+  // are visible via PCIe immediately. If sync triggers SIGABRT from a GPU fault,
+  // we still got the trace.
+  if (stageSet == 1) {
+    S32* trace = (S32*)m_debugTrace.getPtr();
+    if (trace) {
+      // Brief poll: give the kernel a moment to make progress / fault.
+      for (int i = 0; i < 50; i++) {
+        if (trace[0] > 0) break;
+        usleep(10000); // 10ms x 50 = up to 500ms
+      }
+      std::cerr << "[trace] coarseRaster deepest checkpoint = " << trace[0] << std::endl;
+      std::cerr.flush();
+    }
+  }
   NVDR_CHECK_CUDA_ERROR(hipStreamSynchronize(stream));
-  std::cerr
-      << "[nvdiffrast] fineRasterKernel completed - All rasterization done!"
-      << std::endl;
 }
 
 //------------------------------------------------------------------------
