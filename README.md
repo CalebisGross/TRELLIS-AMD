@@ -70,7 +70,9 @@ Then open http://localhost:7860 in your browser.
 ### Application Modifications
 - HIP rasterizer (CoarseRaster + FineRaster) bounds-check fix for the
   `triHeader[i].misc` OOB on RDNA3 — see [experiments/raster/findings.md](experiments/raster/findings.md#bug-6--triheaderimisc-oob-on-rdna3-resolved-2026-05-09)
-- Disabled `fill_holes` in mesh postprocessing (avoids visibility check issues)
+- `_fill_holes` pole-clamps the Hammersley camera distribution so views
+  directly above/below the mesh don't NaN `view_look_at` and hang
+  coarseRaster (default num_views also dropped 1000 → 100 for speed)
 - Added progress logging for GLB export
 - `example.py` splits the pipeline into staged phases, moving idle
   submodels to CPU between phases so the full run fits in 16 GB VRAM
@@ -96,13 +98,17 @@ The GLB export shows progress in console:
 
 ## Known Limitations
 
-1. **fill_holes Disabled**: Small holes in meshes may not be filled
-2. **Performance**: Coarse rasterizer is serialized and slower than NVIDIA's warp-parallel version
-3. **~7% silent triangle culls**: The Bug 6 bounds-check fix culls triangles
+1. **Performance**: Coarse rasterizer is serialized and slower than NVIDIA's warp-parallel version
+2. **~7% silent triangle culls**: The Bug 6 bounds-check fix culls triangles
    with an out-of-range `triHeader[i].misc` from triangleSetup. Visual impact
    is small but the underlying invariant violation is unresolved. See
    [experiments/raster/findings.md](experiments/raster/findings.md#bug-6--triheaderimisc-oob-on-rdna3-resolved-2026-05-09)
    for the Phase C root-cause hypothesis.
+3. **fill_holes uses 100 views, not 1000**: TRELLIS upstream rasterizes 1000
+   Hammersley-distributed views to detect invisible faces. We clamp views
+   away from the world-up poles (otherwise the HIP rasterizer hangs on
+   degenerate view matrices) and use 100 views. Hole detection quality is
+   visually indistinguishable, and step 1 of GLB extract is now ~10x faster.
 
 ## Troubleshooting
 

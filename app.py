@@ -230,7 +230,7 @@ def extract_glb(
     if mesh is None:
         raise gr.Error("GLB extraction requires mesh data. Re-run with mesh generation enabled.")
     
-    glb = postprocessing_utils.to_glb(gs, mesh, simplify=mesh_simplify, texture_size=texture_size, verbose=False)
+    glb = postprocessing_utils.to_glb(gs, mesh, simplify=mesh_simplify, texture_size=texture_size, verbose=True)
     glb_path = os.path.join(user_dir, 'sample.glb')
     glb.export(glb_path)
     torch.cuda.empty_cache()

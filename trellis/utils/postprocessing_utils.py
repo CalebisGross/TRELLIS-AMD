@@ -43,11 +43,16 @@ def _fill_holes(
         num_views (int): Number of views to rasterize the mesh.
         verbose (bool): Whether to print progress.
     """
-    # Construct cameras
+    # Construct cameras. Hammersley pitches near +/- pi/2 put the camera
+    # directly above/below origin, making view_look_at degenerate (camera
+    # forward parallel to world-up). On AMD HIP that produces NaN clip-space
+    # verts, which hang coarseRaster forever. Pull pitches in by an epsilon.
+    pole_eps = 0.05  # radians (~3 deg)
     yaws = []
     pitchs = []
     for i in range(num_views):
         y, p = sphere_hammersley_sequence(i, num_views)
+        p = max(-np.pi / 2 + pole_eps, min(np.pi / 2 - pole_eps, p))
         yaws.append(y)
         pitchs.append(p)
     yaws = torch.tensor(yaws).cuda()
@@ -67,37 +72,6 @@ def _fill_holes(
     views = torch.stack(views, dim=0)
 
     # Rasterize
-    print(f"[fill_holes] Starting rasterization: {faces.shape[0]} faces, {verts.shape[0]} verts, {num_views} views, resolution={resolution}")
-    print(f"[fill_holes] Vertex bounds: min={verts.min(dim=0).values.tolist()}, max={verts.max(dim=0).values.tolist()}")
-    # Check clip-space transform for view 0
-    _test_v = torch.cat([verts, torch.ones_like(verts[..., :1])], dim=-1)  # [V, 4]
-    _test_mvp = projection @ views[0]
-    _test_clip = _test_v @ _test_mvp.transpose(-1, -2)  # [V, 4]
-    _test_ndc = _test_clip[:, :3] / _test_clip[:, 3:4]  # perspective divide
-    print(f"[fill_holes] View 0 clip-space: w range=[{_test_clip[:,3].min().item():.4f}, {_test_clip[:,3].max().item():.4f}]")
-    print(f"[fill_holes] View 0 NDC: x=[{_test_ndc[:,0].min().item():.4f}, {_test_ndc[:,0].max().item():.4f}], y=[{_test_ndc[:,1].min().item():.4f}, {_test_ndc[:,1].max().item():.4f}], z=[{_test_ndc[:,2].min().item():.4f}, {_test_ndc[:,2].max().item():.4f}]")
-    del _test_v, _test_mvp, _test_clip, _test_ndc
-
-    # Diagnostic: test rasterizer with simple triangle + real mesh on fresh context
-    import nvdiffrast.torch as dr_diag
-    _diag_ctx = dr_diag.RasterizeCudaContext()
-    # Test 1: simple clip-space triangle (should cover ~25% of screen)
-    _diag_tri = torch.tensor([[0, 1, 2]], dtype=torch.int32, device='cuda')
-    _diag_verts = torch.tensor([
-        [-0.5, -0.5, 0.5, 1.0],
-        [ 0.5, -0.5, 0.5, 1.0],
-        [ 0.0,  0.5, 0.5, 1.0],
-    ], dtype=torch.float32, device='cuda')[None]
-    _diag_out, _ = dr_diag.rasterize(_diag_ctx, _diag_verts, _diag_tri, resolution=[resolution, resolution])
-    print(f"[fill_holes] DIAG simple triangle: mask pixels={(_diag_out[..., 3] > 0).sum().item()}")
-    # Test 2: real mesh with pre-computed clip-space positions
-    _real_v = torch.cat([verts, torch.ones_like(verts[..., :1])], dim=-1)[None]  # [1, V, 4]
-    _real_mvp = projection @ views[0]
-    _real_clip = _real_v @ _real_mvp.transpose(-1, -2)
-    _real_out, _ = dr_diag.rasterize(_diag_ctx, _real_clip, faces, resolution=[resolution, resolution])
-    print(f"[fill_holes] DIAG real mesh direct: mask pixels={(_real_out[..., 3] > 0).sum().item()}")
-    del _diag_ctx, _diag_tri, _diag_verts, _diag_out, _real_v, _real_mvp, _real_clip, _real_out
-
     visblity = torch.zeros(faces.shape[0], dtype=torch.int32, device=verts.device)
     rastctx = utils3d.torch.RastContext(backend='gl')
     for i in tqdm(range(views.shape[0]), total=views.shape[0], disable=not verbose, desc='Rasterizing'):
@@ -108,11 +82,7 @@ def _fill_holes(
         face_id = buffers['face_id'][0][buffers['mask'][0] > 0.95] - 1
         face_id = torch.unique(face_id).long()
         visblity[face_id] += 1
-        if i == 0:
-            print(f"[fill_holes] View 0: mask pixels={(buffers['mask'][0] > 0.95).sum().item()}, unique faces={face_id.shape[0]}, face_id range=[{face_id.min().item() if face_id.numel() > 0 else 'empty'}, {face_id.max().item() if face_id.numel() > 0 else 'empty'}]")
     visblity = visblity.float() / num_views
-    visible_count = (visblity > 0).sum().item()
-    print(f"[fill_holes] After rasterization: {visible_count}/{faces.shape[0]} faces visible (max visibility={visblity.max().item():.4f})")
 
     # Mincut
     ## construct outer faces
@@ -240,7 +210,7 @@ def postprocess_mesh(
     fill_holes_max_hole_size: float = 0.04,
     fill_holes_max_hole_nbe: int = 32,
     fill_holes_resolution: int = 1024,
-    fill_holes_num_views: int = 1000,
+    fill_holes_num_views: int = 100,
     debug: bool = False,
     verbose: bool = False,
 ):
@@ -470,7 +440,7 @@ def to_glb(
         fill_holes_max_hole_size=fill_holes_max_size,
         fill_holes_max_hole_nbe=int(250 * np.sqrt(1-simplify)),
         fill_holes_resolution=1024,
-        fill_holes_num_views=1000,
+        fill_holes_num_views=100,
         debug=debug,
         verbose=verbose,
     )
