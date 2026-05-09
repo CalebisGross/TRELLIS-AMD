@@ -59,4 +59,10 @@ CLAUDE.md
 
 # raster_repro: generated mesh dumps and test history (regenerable, not source)
 tools/raster_repro/inputs.pt
+tools/raster_repro/inputs_*.pt
 tools/raster_repro/results.jsonl
+
+# example.py / app.py outputs
+sample.glb
+sample.ply
+sample_*.mp4
