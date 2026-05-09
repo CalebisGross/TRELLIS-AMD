@@ -226,6 +226,45 @@ The diag printf will inflate VGPRs again — gate it behind
 CR_DEBUG_OOB and run only on the harness with T.ply (already a
 clean repro per Test 135's "deepest checkpoint = 0" trace).
 
+## Bug 7 — Hammersley pole views hang coarseRaster on NaN inputs (RESOLVED 2026-05-09)
+
+**Resolution:** Pole-clamp the pitch range in `_fill_holes` so cameras
+never sit directly above/below the look-at target. Commit `f3998bd`,
+file `trellis/utils/postprocessing_utils.py`.
+
+**Symptom:** GLB extract step 1 (`_fill_holes` rasterize loop) hangs
+indefinitely. py-spy shows the worker thread parked in
+`_nvdiffrast_c.rasterize_fwd_cuda`. GPU pinned at 100%, no wavering.
+`hipStreamSynchronize` blocks forever. NOT a crash — an unbounded
+kernel-side loop.
+
+**Root cause:** `sphere_hammersley_sequence` returns pitches in
+`[-pi/2, +pi/2]`. At the poles (`pitch = +/- pi/2`), `cos(pitch) = 0`,
+so the camera origin in `_fill_holes` becomes `(0, 0, +/- radius)` —
+directly above/below the look-at target, parallel to world-up
+`(0, 0, 1)`. `view_look_at`'s cross product collapses, the resulting
+view matrix contains NaN entries. NaN clip-space verts feed into
+`coarseRasterImpl` and trigger an unbounded loop somewhere in the
+bin-walk machinery (still unconfirmed which exact loop, but easy to
+reproduce: project an all-NaN triangle).
+
+NVIDIA hardware appears to guard against this — feeding NaN clip-space
+verts into the upstream nvdiffrast doesn't hang. AMD HIP doesn't.
+
+**Fix:** Clamp pitch to `+/- (pi/2 - 0.05 rad)` (~3 degrees away from
+the poles) before constructing camera transforms. Visually
+indistinguishable from the original distribution; structurally avoids
+the degenerate case entirely.
+
+**Why this didn't bite before Bug 6 was fixed:** Pre-Bug-6, the
+rasterizer crashed on real meshes long before reaching `_fill_holes` in
+GLB extract. `_fill_holes` only became reachable once Bug 6 was fixed;
+at that point Bug 7 surfaced as the next blocker.
+
+**Defensive improvement worth considering for the rasterizer itself:**
+detect NaN/Inf in the bin-walk loops and bail out. Out of scope for the
+current PR but a real correctness gap.
+
 ## Stale-binary trap (operational)
 
 Tests 55-59 reported PASS with stale 32 KB + no-op binaries despite the

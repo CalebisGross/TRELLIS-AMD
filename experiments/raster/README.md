@@ -1,8 +1,11 @@
 # nvdiffrast HIP rasterizer investigation
 
-Active investigation into GPU memory faults in the HIP-ported nvdiffrast
-rasterizer when rendering real TRELLIS meshes (~290K-320K triangles) on
-AMD RDNA3 (gfx1101).
+Investigation into GPU memory faults + downstream pipeline issues in the
+HIP-ported nvdiffrast rasterizer when rendering real TRELLIS meshes
+(~290K-320K triangles) on AMD RDNA3 (gfx1101). **Status: resolved
+2026-05-09 — full image-to-textured-GLB pipeline works end-to-end on
+RX 7800 XT.** This directory remains the lab notebook for the multi-month
+hunt + the still-open Phase C root-cause work.
 
 ## Why this directory exists
 
@@ -17,9 +20,9 @@ operational and lives in CLAUDE.md; the lab notebook lives here.
 ## Current investigation state
 
 - **Branch:** `wip-amd-raster-investigation`
-- **Last commit:** `7343575` (example.py phase-aware offload)
+- **Last commit:** `f3998bd` (fill_holes works on AMD: pole-clamp, drop diag block, num_views 100)
 - **Toolchain:** torch 2.10.0+rocm7.0 (HIP 7.0.51831), system ROCm 7.2.1
-- **Kernel state:** Both real impls active. Bug 6 fixed via bounds checks at the `triHeader[]` read sites. Tests 132 (60-frame harness), 133 (end-to-end TRELLIS mesh, 300 frames @ 2048²), 135 (real-mesh harness fixture from `assets/T.ply`) all clean.
+- **Kernel state:** Both real impls active. Bug 6 fixed via bounds checks at the `triHeader[]` read sites. Tests 132 (60-frame harness), 133 (end-to-end TRELLIS mesh, 300 frames @ 2048²), 135 (real-mesh harness fixture from `assets/T.ply`) all clean. Full GLB extract pipeline (including fill_holes + texture bake) confirmed end-to-end via app.py.
 - **Static __shared__:** `s_smem[32768]` (32 KB) in `rasterKernel`.
 - **Constants:** `CR_COARSE_WARPS=8`, `CR_FINE_MAX_WARPS=12` (canonical in
   `extensions/nvdiffrast-hip/csrc/common/cudaraster/impl/Constants.hpp`; hipify
@@ -44,20 +47,19 @@ Validated:
 
 See [findings.md § Bug 6](findings.md#bug-6--triheaderimisc-oob-on-rdna3-resolved-2026-05-09).
 
-Next session attack:
+Open follow-ups (not blocking PR):
 
 1. **Phase C — root cause of `triHeader[i].misc` OOB.** The bounds-check
    fix is defensive; ~7% of triangles per frame still get silently
    culled. The real question: is `triangleSetup` failing to write
    `.misc` for some entries, or is `binRaster` pushing stale `triIdx`
    values into `binSegData`? Both possibilities need a bisect inside
-   their own kernels.
+   their own kernels. See [findings.md § Bug 6](findings.md#bug-6--triheaderimisc-oob-on-rdna3-resolved-2026-05-09)
+   for the Phase C plan.
 2. **Larger real-mesh fixture.** Capture a TRELLIS-pipeline-generated
    GLB into `inputs.pt` (327k subtris) so the harness covers the full
    triangle distribution that crashed before. T.ply (61k tris) is a
    useful regression but doesn't stress the same scale.
-3. Re-enable mesh-preview in `app.py` (currently has try/except SAFE-MODE
-   wrap from the historical fault).
 
 ## Reproducing
 

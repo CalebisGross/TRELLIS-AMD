@@ -22,7 +22,6 @@ from trellis.utils import render_utils, postprocessing_utils
 # Use GatherScatter dataflow instead of ImplicitGEMM (which requires PTX assembly)
 if os.environ.get('SPARSE_BACKEND') == 'torchsparse' and hasattr(torch.version, 'hip'):
     try:
-        import torchsparse.nn.functional as F
         from torchsparse.nn.functional.conv.conv_config import (
             Dataflow, set_global_conv_config, _default_conv_config
         )
@@ -116,7 +115,6 @@ def unpack_state(state: dict) -> Tuple[Gaussian, edict, str]:
     gs._rotation = torch.tensor(state['gaussian']['_rotation'], device='cuda')
     gs._opacity = torch.tensor(state['gaussian']['_opacity'], device='cuda')
     
-    # Handle missing mesh in gaussian-only mode
     mesh = None
     if 'mesh' in state:
         mesh = edict(

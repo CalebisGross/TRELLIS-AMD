@@ -67,7 +67,6 @@ image = Image.open("assets/example_image/T.png")
 # (5 submodels resident + sampling activations + decoder output) exceeds
 # VRAM. We split the run manually so we can move idle submodels to CPU
 # between phases.
-import torch
 formats = os.environ.get('OUTPUT_FORMATS', 'mesh,gaussian').split(',')
 formats = [f.strip() for f in formats if f.strip()]
 print(f"[example] decoding formats: {formats}")

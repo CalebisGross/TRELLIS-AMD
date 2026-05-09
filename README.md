@@ -117,7 +117,9 @@ Ensure you're using ROCm 7.0+ and PyTorch built for ROCm (torch 2.10.0+rocm7.0
 or newer is recommended).
 
 ### Empty Mesh
-Check that `fill_holes=False` is set in `trellis/utils/postprocessing_utils.py`.
+Confirm the input image actually has a foreground subject after rembg
+background removal. If so, raise the `Mesh Simplify` slider toward 0 in
+the UI to keep more triangles, or pass `simplify=0.0` to `to_glb()`.
 
 ### CUDA Symbol Errors  
 Make sure you're using the AMD-modified extensions in this repo, not the original CUDA ones.
