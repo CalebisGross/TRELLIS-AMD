@@ -396,13 +396,6 @@ void RasterImpl::launchStages(bool instanceMode, bool peel,
     p.tileFirstSeg = m_tileFirstSeg.getPtr();
     p.warpEmitGlobal = m_warpEmitGlobal.getPtr();
     p.debugTrace = m_debugTrace.getPtr();
-    // Reset diagnostic trace at start of each draw. Init slot 9 to
-    // UINT32_MAX so atomicMin works correctly. Slots 0..8, 10+ = 0.
-    {
-      uint32_t* dbgU = (uint32_t*)m_debugTrace.getPtr();
-      memset(dbgU, 0, 64 * sizeof(uint32_t));
-      dbgU[9] = 0xFFFFFFFFu;
-    }
     size_t byteOffset =
         ((size_t)m_offsetPixels.x +
          (size_t)m_offsetPixels.y * (size_t)m_bufferSizePixels.x) *
@@ -453,16 +446,12 @@ void RasterImpl::launchStages(bool instanceMode, bool peel,
         dim3(m_numSMs * m_numCoarseBlocksPerSM, 1, m_numImages),
         dim3(32, CR_COARSE_WARPS), argsR0, 0, stream));
 
-    // Test 122: skip fine launch entirely. If coarse alone passes,
-    // fault is somehow from fine. If still crashes, fault is in coarse.
-#if 0
     int stage1 = 1;
     void *argsR1[] = {&d_crParams, &stage1};
     NVDR_CHECK_CUDA_ERROR(hipLaunchKernel(
         (void *)rasterKernel,
         dim3(m_numSMs * m_numFineBlocksPerSM, 1, m_numImages),
         dim3(32, m_numFineWarpsPerBlock), argsR1, 0, stream));
-#endif
 
   } else {
     // Peel: fineRaster only (1 dispatch). Static smem, 0 dynamic.
@@ -493,47 +482,6 @@ void RasterImpl::launchStages(bool instanceMode, bool peel,
         usleep(10000); // 10ms x 50 = up to 500ms
       }
       std::cerr << "[trace] coarseRaster deepest checkpoint = " << trace[0] << std::endl;
-      // Test 115+ diagnostic dump. Slots 1..7 hold the values written by
-      // the kernel's per-warp atomicCAS-protected diagnostic block. See
-      // CoarseRaster.inl line ~360.
-      // Always print slot 12-14 if any of them is set (Test 123+ triIdx diag)
-      if (trace[12] || trace[13] || trace[14] || trace[16] || trace[17]) {
-        uint32_t triIdx = (uint32_t)trace[12];
-        uint32_t dataIdx = (uint32_t)trace[13];
-        uint32_t maxSubtris = (uint32_t)trace[14];
-        uint32_t preCnt = (uint32_t)trace[16];
-        uint32_t postCnt = (uint32_t)trace[17];
-        std::cerr << "[diag-tri] sample triIdx=" << triIdx
-                  << " dataIdx=" << dataIdx
-                  << " maxSubtris=" << maxSubtris
-                  << std::endl;
-        std::cerr << "[diag-OOB-counts] pre-misc OOB threads=" << preCnt
-                  << " post-misc OOB threads=" << postCnt
-                  << std::endl;
-        if (trace[18]) {
-          std::cerr << "[diag-preOOB-sample] triIdx=" << (uint32_t)trace[19]
-                    << " origDataIdx=" << (uint32_t)trace[20]
-                    << " threadIdx=(" << ((trace[21] >> 16) & 0xffff)
-                    << "," << (trace[21] & 0xffff) << ")"
-                    << std::endl;
-        }
-        if (trace[22]) {
-          std::cerr << "[diag-postOOB-sample] triIdx=" << (uint32_t)trace[23]
-                    << " origDataIdx=" << (uint32_t)trace[24]
-                    << " subtriIdx=" << (uint32_t)trace[25]
-                    << " final_dataIdx=" << (int32_t)trace[26]
-                    << " misc=" << (uint32_t)trace[27]
-                    << std::endl;
-        }
-      }
-      if (trace[1]) {
-        uint64_t offset = ((uint64_t)(uint32_t)trace[3] << 32) | (uint32_t)trace[2];
-        std::cerr << "[diag-sample] currPtr_offset=" << offset
-                  << " threadIdx=(" << ((trace[4] >> 16) & 0xffff) << "," << (trace[4] & 0xffff) << ")"
-                  << " lox=" << ((trace[5] >> 16) & 0xffff) << " loy=" << (trace[5] & 0xffff)
-                  << " blockIdx=(" << ((trace[6] >> 16) & 0xffff) << ",_," << (trace[6] & 0xffff) << ")"
-                  << std::endl;
-      }
       std::cerr.flush();
     }
   }

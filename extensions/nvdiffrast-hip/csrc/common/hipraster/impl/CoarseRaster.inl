@@ -18,11 +18,9 @@ __device__ __inline__ int globalTileIdx(int tileInBin, int widthTiles) {
 //------------------------------------------------------------------------
 
 __device__ __inline__ void coarseRasterImpl(const CRParams& p, char* s_smem) {
-  // SAFE-MODE temporarily disabled for Test 116 diagnostic. The real
-  // impl returns at line ~363 after recording currPtr diagnostics, no
-  // offending write performed. Restore SAFE-MODE after the run.
-  // Diagnostic checkpoint markers + Test 42 OOB clamps remain below for
-  // future debugging.
+  // SAFE-MODE removed 2026-05-09 (Test 127). Bug 6 (triHeader[i].misc OOB)
+  // fixed via bounds checks at the triHeader read site (~line 311).
+  // Diagnostic checkpoint markers + Test 42 OOB checks remain below.
   S32* dbg = (S32*)p.debugTrace;
   if (dbg) atomicMax(dbg, 1);
   CoarseSmem& smem = *(CoarseSmem*)s_smem;
@@ -98,9 +96,7 @@ __device__ __inline__ void coarseRasterImpl(const CRParams& p, char* s_smem) {
   if (thrInBlock == 0) {
     s_tileEmitPrefixSum[0] = 0;
     s_tileAllocPrefixSum[0] = 0;
-#if CR_DEBUG_OOB
     s_oobCount = 0;
-#endif
   }
   s_scanTemp[threadIdx.y][threadIdx.x] = 0;
 
@@ -311,45 +307,25 @@ __device__ __inline__ void coarseRasterImpl(const CRParams& p, char* s_smem) {
           triIdx = s_triQueue[(triQueueReadPos + thrInBlock) &
                               (CR_COARSE_QUEUE_SIZE - 1)];
 
-        // Test 125: count number of threads where bounds check would
-        // fire. atomicAdd to dbg[16] every time pre-.misc dataIdx is
-        // OOB; atomicAdd to dbg[17] every time post-.misc dataIdx is
-        // OOB. atomicCAS for one OOB sample to dbg[18..21].
         uint4 triData = make_uint4(0, 0, 0, 0);
         if (triIdx != -1) {
           int dataIdx = triIdx >> 3;
           int subtriIdx = triIdx & 7;
-          int origDataIdx = dataIdx;
-          bool preOOB = (dataIdx >= (int)p.maxSubtris);
+          // RDNA3/ROCm 7.2 fix (2026-05-09 Tests 123-126): triHeader[i].misc
+          // can return uninitialized garbage on RDNA3 (observed value
+          // 4138327560 = 0xF6A4_18B8 for triIdx=0, ~7% of active threads
+          // affected per icosphere mesh). The original NVIDIA code assumed
+          // triangleSetup writes a valid .misc for every entry that ends
+          // up in binSegData; on AMD, that invariant breaks and the
+          // resulting OOB triHeader[dataIdx] read faults the GPU
+          // (hipErrorIllegalAddress). Bounds-check both reads. Threads
+          // with bad indices skip this triangle — equivalent to it being
+          // culled, which is the safe behavior.
           if (subtriIdx != 7) {
-            if (!preOOB)
+            if (dataIdx >= 0 && dataIdx < (int)p.maxSubtris)
               dataIdx = triHeader[dataIdx].misc + subtriIdx;
             else
               dataIdx = -1;
-          }
-          bool postOOB = (dataIdx < 0 || dataIdx >= (int)p.maxSubtris);
-          if (preOOB && dbg) {
-            U32* dbgU = (U32*)dbg;
-            atomicAdd(&dbgU[16], 1u);
-            // Capture first OOB sample
-            if (atomicCAS(&dbgU[18], 0u, 1u) == 0u) {
-              dbgU[19] = (U32)triIdx;
-              dbgU[20] = (U32)origDataIdx;
-              dbgU[21] = (U32)((threadIdx.y << 16) | threadIdx.x);
-            }
-          }
-          if (!preOOB && postOOB && dbg) {
-            U32* dbgU = (U32*)dbg;
-            atomicAdd(&dbgU[17], 1u);
-            // Capture first post-OOB sample
-            if (atomicCAS(&dbgU[22], 0u, 1u) == 0u) {
-              dbgU[23] = (U32)triIdx;
-              dbgU[24] = (U32)origDataIdx;
-              dbgU[25] = (U32)subtriIdx;
-              dbgU[26] = (U32)dataIdx;       // post-.misc dataIdx (could be huge or -1)
-              // Also capture .misc itself
-              dbgU[27] = (U32)triHeader[origDataIdx].misc;
-            }
           }
           if (dataIdx >= 0 && dataIdx < (int)p.maxSubtris)
             triData = *((uint4 *)triHeader + dataIdx);
@@ -386,26 +362,124 @@ __device__ __inline__ void coarseRasterImpl(const CRParams& p, char* s_smem) {
           int ptrYInc = CR_BIN_SIZE * 4 - (sizex << 2);
           U32 maskBit = 1 << threadIdx.x;
 
-          // Test 121: ONLY thread (0,0,0,0) reads from currPtr — every
-          // other thread does NOTHING. If kernel passes, currPtr OOB
-          // is the issue for OTHER threads. If still crashes, fault
-          // is elsewhere.
-          if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0 && blockIdx.z == 0 && triIdx != -1 && dbg) {
-            U32 sample = *(volatile U32*)currPtr;
-            U32* dbgU = (U32*)dbg;
-            uintptr_t base = (uintptr_t)p.warpEmitGlobal;
-            uintptr_t cp = (uintptr_t)currPtr;
-            uintptr_t offset = cp - base;
-            dbgU[1] = 1u;
-            dbgU[2] = (U32)(offset & 0xFFFFFFFFu);
-            dbgU[3] = (U32)(offset >> 32);
-            dbgU[4] = (U32)((threadIdx.y << 16) | threadIdx.x);
-            dbgU[5] = (U32)((lox << 16) | (loy & 0xFFFFu));
-            dbgU[6] = (U32)((blockIdx.x << 16) | (blockIdx.z & 0xFFFFu));
-            dbgU[7] = (U32)maxTileXInBin;
-            dbgU[11] = sample;
+          // Case A: All AABBs are small => record the full AABB using atomics.
+
+          if (__all_sync(~0u, sizex <= 2 && sizey <= 2)) {
+            if (triIdx != -1) {
+              atomicOr((U32 *)currPtr, maskBit);
+              if (sizex == 2)
+                atomicOr((U32 *)(currPtr + 4), maskBit);
+              if (sizey == 2)
+                atomicOr((U32 *)(currPtr + CR_BIN_SIZE * 4), maskBit);
+              if (sizex == 2 && sizey == 2)
+                atomicOr((U32 *)(currPtr + 4 + CR_BIN_SIZE * 4), maskBit);
+            }
+          } else {
+            // Compute warp-AABB (scan-32).
+
+            U32 aabbMask =
+                add_sub(2 << hix, 0x20000 << hiy, 1 << lox) - (0x10000 << loy);
+            if (triIdx == -1)
+              aabbMask = 0;
+
+            volatile U32 *v = &s_scanTemp[threadIdx.y][threadIdx.x + 16];
+            v[0] = aabbMask;
+            __syncwarp();
+            aabbMask |= v[-1];
+            __syncwarp();
+            v[0] = aabbMask;
+            __syncwarp();
+            aabbMask |= v[-2];
+            __syncwarp();
+            v[0] = aabbMask;
+            __syncwarp();
+            aabbMask |= v[-4];
+            __syncwarp();
+            v[0] = aabbMask;
+            __syncwarp();
+            aabbMask |= v[-8];
+            __syncwarp();
+            v[0] = aabbMask;
+            __syncwarp();
+            aabbMask |= v[-16];
+            __syncwarp();
+            v[0] = aabbMask;
+            __syncwarp();
+            aabbMask = s_scanTemp[threadIdx.y][47];
+
+            U32 maskX = aabbMask & 0xFFFF;
+            U32 maskY = aabbMask >> 16;
+            int wlox = findLeadingOne(maskX ^ (maskX - 1));
+            int wloy = findLeadingOne(maskY ^ (maskY - 1));
+            int whix = findLeadingOne(maskX);
+            int whiy = findLeadingOne(maskY);
+            int warea = (add_sub(whix, 1, wlox)) * (add_sub(whiy, 1, wloy));
+
+            // Initialize edge functions.
+
+            S32 d12x = d02x - d01x;
+            S32 d12y = d02y - d01y;
+            v0x -= lox << tileLog;
+            v0y -= loy << tileLog;
+
+            S32 t01 = v0x * d01y - v0y * d01x;
+            S32 t02 = v0y * d02x - v0x * d02y;
+            S32 t12 = d01x * d12y - d01y * d12x - t01 - t02;
+            S32 b01 = add_sub(t01 >> tileLog, ::max(d01x, 0), ::min(d01y, 0));
+            S32 b02 = add_sub(t02 >> tileLog, ::max(d02y, 0), ::min(d02x, 0));
+            S32 b12 = add_sub(t12 >> tileLog, ::max(d12x, 0), ::min(d12y, 0));
+
+            d01x += sizex * d01y;
+            d02x += sizex * d02y;
+            d12x += sizex * d12y;
+
+            // Case B: Warp-AABB is not much larger than largest AABB => Check
+            // tiles in warp-AABB, record using ballots.
+            if (__any_sync(~0u, warea * 4 <= area * 8)) {
+              // Not sure if this is any faster than Case C after all the
+              // post-Volta ballot mask tracking.
+              bool act = (triIdx != -1);
+              U32 actMask = __ballot_sync(~0u, act);
+              if (act) {
+                for (int y = wloy; y <= whiy; y++) {
+                  bool yIn = (y >= loy && y <= hiy);
+                  U32 yMask = __ballot_sync(actMask, yIn);
+                  if (yIn) {
+                    for (int x = wlox; x <= whix; x++) {
+                      bool xyIn = (x >= lox && x <= hix);
+                      U32 xyMask = __ballot_sync(yMask, xyIn);
+                      if (xyIn) {
+                        U32 res = __ballot_sync(xyMask, b01 >= 0 && b02 >= 0 &&
+                                                            b12 >= 0);
+                        if (threadIdx.x == 31 - __clz(xyMask))
+                          *(U32 *)currPtr = res;
+                        currPtr += 4, b01 -= d01y, b02 += d02y, b12 -= d12y;
+                      }
+                    }
+                    currPtr += ptrYInc, b01 += d01x, b02 -= d02x, b12 += d12x;
+                  }
+                }
+              }
+            }
+
+            // Case C: General case => Check tiles in AABB, record using
+            // atomics.
+
+            else {
+              if (triIdx != -1) {
+                U8 *skipPtr = currPtr + (sizex << 2);
+                U8 *endPtr = currPtr + (sizey << (CR_BIN_LOG2 + 2));
+                do {
+                  if (b01 >= 0 && b02 >= 0 && b12 >= 0)
+                    atomicOr((U32 *)currPtr, maskBit);
+                  currPtr += 4, b01 -= d01y, b02 += d02y, b12 -= d12y;
+                  if (currPtr == skipPtr)
+                    currPtr += ptrYInc, b01 += d01x, b02 -= d02x, b12 += d12x,
+                        skipPtr += CR_BIN_SIZE * 4;
+                } while (currPtr != endPtr);
+              }
+            }
           }
-          return;
         }
 
         __syncthreads();
@@ -699,12 +773,10 @@ __device__ __inline__ void coarseRasterImpl(const CRParams& p, char* s_smem) {
           // Test 42: bounds check tileSegData write.
           if (outOfs >= 0 && outOfs < maxTileSegOfs)
             tileSegData[outOfs] = triIdx;
-#if CR_DEBUG_OOB
           else if (atomicAdd((S32*)&s_oobCount, 1) < 4)
             printf("[OOB-A] outOfs=%d max=%d tile=%d emit=%d currOfs=%d spaceLeft=%d allocLo=%d firstAlloc=%d\n",
                    outOfs, maxTileSegOfs, tileInBin, emitInTile, currOfs, spaceLeft,
                    firstAllocSeg + (int)s_tileAllocPrefixSum[tileInBin], firstAllocSeg);
-#endif
         }
 
         //------------------------------------------------------------------------
@@ -720,12 +792,9 @@ __device__ __inline__ void coarseRasterImpl(const CRParams& p, char* s_smem) {
           if (segIdx >= 0 && segIdx < p.maxTileSegs) {
             tileSegNext[segIdx] = segIdx + 1;
             tileSegCount[segIdx] = CR_TILE_SEG_SIZE;
-          }
-#if CR_DEBUG_OOB
-          else if (atomicAdd((S32*)&s_oobCount, 1) < 4)
+          } else if (atomicAdd((S32*)&s_oobCount, 1) < 4)
             printf("[OOB-B] segIdx=%d max=%d i=%d firstAlloc=%d totalAllocs=%d\n",
                    segIdx, p.maxTileSegs, i, firstAllocSeg, totalAllocs);
-#endif
         }
 
         // Tile per thread: Fix previous segment's next-pointer and update
@@ -748,11 +817,9 @@ __device__ __inline__ void coarseRasterImpl(const CRParams& p, char* s_smem) {
               int nextSegIdx = (oldOfs - 1) >> CR_TILE_SEG_LOG2;
               if (nextSegIdx >= 0 && nextSegIdx < p.maxTileSegs)
                 tileSegNext[nextSegIdx] = firstAllocSeg + allocLo;
-#if CR_DEBUG_OOB
               else if (atomicAdd((S32*)&s_oobCount, 1) < 4)
                 printf("[OOB-C] nextSegIdx=%d max=%d oldOfs=%d tileInBin=%d allocLo=%d\n",
                        nextSegIdx, p.maxTileSegs, oldOfs, tileInBin, allocLo);
-#endif
             }
 
             newOfs--;
@@ -793,11 +860,9 @@ __device__ __inline__ void coarseRasterImpl(const CRParams& p, char* s_smem) {
           // Test 42: bounds check tileSegNext finalize write.
           if (segIdx >= 0 && segIdx < p.maxTileSegs)
             tileSegNext[segIdx] = -1;
-#if CR_DEBUG_OOB
           else if (atomicAdd((S32*)&s_oobCount, 1) < 4)
             printf("[OOB-D] segIdx=%d max=%d ofs=%d tileInBin=%d\n",
                    segIdx, p.maxTileSegs, ofs, tileInBin);
-#endif
         } else if (force) {
           s_tileStreamCurrOfs[tileInBin] = 0;
           tileFirstSeg[binTileIdx + tileX + tileY * p.widthTiles] = -1;
@@ -807,11 +872,9 @@ __device__ __inline__ void coarseRasterImpl(const CRParams& p, char* s_smem) {
           // Test 42: bounds check tileSegCount finalize write.
           if (segIdx >= 0 && segIdx < p.maxTileSegs)
             tileSegCount[segIdx] = segCount;
-#if CR_DEBUG_OOB
           else if (atomicAdd((S32*)&s_oobCount, 1) < 4)
             printf("[OOB-E] segIdx=%d max=%d ofs=%d segCount=%d tileInBin=%d\n",
                    segIdx, p.maxTileSegs, ofs, segCount, tileInBin);
-#endif
         }
 
         U32 res = __ballot_sync(actMask, ofs >= 0 | force);

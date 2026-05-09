@@ -54,9 +54,20 @@ __device__ __inline__ void getTriangle(const CRParams& p, S32& triIdx, S32& data
         triIdx = subtriIdx >> 3;
         dataIdx = triIdx;
         subtriIdx &= 7;
-        if (subtriIdx != 7)
-            dataIdx = triHeaderPtr[triIdx].misc + subtriIdx;
-        triHeader = *((uint4*)triHeaderPtr + dataIdx);
+        // RDNA3/ROCm 7.2 fix (matches coarseRasterImpl Bug 6): triHeaderPtr[triIdx].misc
+        // can return uninitialized garbage on AMD; guard against OOB before
+        // the indirection AND before the final uint4 read. See
+        // experiments/raster/findings.md "Bug 6".
+        if (subtriIdx != 7) {
+            if (triIdx >= 0 && triIdx < (int)p.maxSubtris)
+                dataIdx = triHeaderPtr[triIdx].misc + subtriIdx;
+            else
+                dataIdx = -1;
+        }
+        if (dataIdx >= 0 && dataIdx < (int)p.maxSubtris)
+            triHeader = *((uint4*)triHeaderPtr + dataIdx);
+        else
+            triHeader = make_uint4(0, 0, 0, 0); // safe default
     }
 
     // advance to next segment
@@ -176,7 +187,10 @@ __device__ __inline__ void executeROP(U32 color, U32 depth, volatile U32* pColor
 
 __device__ __inline__ void fineRasterImpl(const CRParams& p, char* s_smem)
 {
-    return; // SAFE-MODE: pair with coarseRaster's safe-mode. Bisect (Test 75) showed bug is in coarse, not fine.
+    return; // SAFE-MODE: getTriangle() bounds-check applied but
+            // fineRasterImpl has additional OOB sites (Test 129).
+            // coarseRasterImpl works end-to-end as of Test 128.
+            // Fine investigation continues next session.
     FineSmem& smem = *(FineSmem*)s_smem;
 
     // Alias struct members to original variable names so code below is unchanged.
