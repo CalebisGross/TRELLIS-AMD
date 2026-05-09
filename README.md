@@ -2,7 +2,7 @@
 
 **TRELLIS running on AMD GPUs with ROCm** - Image to 3D Asset Generation
 
-This is a fork of [Microsoft TRELLIS](https://github.com/microsoft/TRELLIS) modified to run on AMD consumer GPUs (tested on RX 7800 XT with ROCm 6.4.2).
+This is a fork of [Microsoft TRELLIS](https://github.com/microsoft/TRELLIS) modified to run on AMD consumer GPUs (tested on RX 7800 XT with ROCm 7.2.1, torch 2.10.0+rocm7.0).
 
 ## Features
 
@@ -18,10 +18,10 @@ This is a fork of [Microsoft TRELLIS](https://github.com/microsoft/TRELLIS) modi
 
 ## Requirements
 
-- AMD GPU (tested: RX 7800 XT, RDNA3)
-- ROCm 6.4+ 
+- AMD GPU (tested: RX 7800 XT, RDNA3 / gfx1101)
+- ROCm 7.0+ (tested on system ROCm 7.2.1, torch 2.10.0+rocm7.0)
 - Python 3.10+
-- ~16GB VRAM recommended
+- 16 GB VRAM (the pipeline is split into staged phases to fit; see [example.py](example.py))
 
 ## Quick Start
 
@@ -68,9 +68,12 @@ Then open http://localhost:7860 in your browser.
 | **torchsparse** | Built with `FORCE_CUDA=1` for HIP GPU backend |
 
 ### Application Modifications
-- Switched to OpenGL rasterization backend (avoids HIP rasterizer bugs)
+- HIP rasterizer (CoarseRaster + FineRaster) bounds-check fix for the
+  `triHeader[i].misc` OOB on RDNA3 — see [experiments/raster/findings.md](experiments/raster/findings.md#bug-6--triheaderimisc-oob-on-rdna3-resolved-2026-05-09)
 - Disabled `fill_holes` in mesh postprocessing (avoids visibility check issues)
 - Added progress logging for GLB export
+- `example.py` splits the pipeline into staged phases, moving idle
+  submodels to CPU between phases so the full run fits in 16 GB VRAM
 
 ## Processing Time Reference
 
@@ -93,14 +96,19 @@ The GLB export shows progress in console:
 
 ## Known Limitations
 
-1. **Mesh Preview**: May show grey - the actual export works correctly
-2. **fill_holes Disabled**: Small holes in meshes may not be filled
-3. **Performance**: Simplified coarse rasterizer is slower than NVIDIA-optimized version
+1. **fill_holes Disabled**: Small holes in meshes may not be filled
+2. **Performance**: Coarse rasterizer is serialized and slower than NVIDIA's warp-parallel version
+3. **~7% silent triangle culls**: The Bug 6 bounds-check fix culls triangles
+   with an out-of-range `triHeader[i].misc` from triangleSetup. Visual impact
+   is small but the underlying invariant violation is unresolved. See
+   [experiments/raster/findings.md](experiments/raster/findings.md#bug-6--triheaderimisc-oob-on-rdna3-resolved-2026-05-09)
+   for the Phase C root-cause hypothesis.
 
 ## Troubleshooting
 
 ### GPU Hang/Crash
-Ensure you're using ROCm 6.4+ and PyTorch built for ROCm.
+Ensure you're using ROCm 7.0+ and PyTorch built for ROCm (torch 2.10.0+rocm7.0
+or newer is recommended).
 
 ### Empty Mesh
 Check that `fill_holes=False` is set in `trellis/utils/postprocessing_utils.py`.
