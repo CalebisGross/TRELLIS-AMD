@@ -187,10 +187,10 @@ __device__ __inline__ void executeROP(U32 color, U32 depth, volatile U32* pColor
 
 __device__ __inline__ void fineRasterImpl(const CRParams& p, char* s_smem)
 {
-    return; // SAFE-MODE: getTriangle() bounds-check applied but
-            // fineRasterImpl has additional OOB sites (Test 129).
-            // coarseRasterImpl works end-to-end as of Test 128.
-            // Fine investigation continues next session.
+    // SAFE-MODE removed (Test 131). Bug 6 bounds checks applied to BOTH
+    // the getTriangle() helper (above) AND the per-fragment triData read
+    // at line ~363. fine should now run safely on data produced by the
+    // fixed coarseRaster.
     FineSmem& smem = *(FineSmem*)s_smem;
 
     // Alias struct members to original variable names so code below is unchanged.
@@ -360,7 +360,15 @@ __device__ __inline__ void fineRasterImpl(const CRParams& p, char* s_smem)
 
                 // depth test
                 U32 depth = 0;
-                uint4 td = *((uint4*)triData + dataIdx * (sizeof(CRTriangleData) >> 4));
+                // Bug 6 fix (2026-05-09): dataIdx may be -1 (from getTriangle's
+                // bounds-check sentinel) when triHeader[i].misc was OOB on RDNA3.
+                // Skip the triData read in that case; treat the fragment as
+                // having maximum depth so it z-fails and gets dropped.
+                uint4 td;
+                if (dataIdx >= 0 && dataIdx < (int)p.maxSubtris)
+                    td = *((uint4*)triData + dataIdx * (sizeof(CRTriangleData) >> 4));
+                else
+                    td = make_uint4(0u, 0u, 0xFFFFFFFFu, 0u); // depth = 0xFFFFFFFF, will z-fail
 
                 depth = td.x * pixelX + td.y * pixelY + td.z;
                 bool zkill = (p.renderModeFlags & CudaRaster::RenderModeFlag_EnableDepthPeeling) && (depth <= tilePeel[pixelInTile]);
