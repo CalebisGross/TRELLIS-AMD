@@ -4,6 +4,12 @@
 
 This is a fork of [Microsoft TRELLIS](https://github.com/microsoft/TRELLIS) modified to run on AMD consumer GPUs (tested on RX 7800 XT with ROCm 7.2.1, torch 2.10.0+rocm7.0).
 
+> **Status (May 2026): Fully operational on RX 7800 XT.** Tested end-to-end:
+> image → 3D asset → textured GLB, including mesh rendering, hole filling, and
+> texture baking on a 16 GB consumer card. The multi-month rasterizer
+> investigation that unblocked this is documented in
+> [experiments/raster/](experiments/raster/).
+
 ## Features
 
 | Feature | Status | Timing |
