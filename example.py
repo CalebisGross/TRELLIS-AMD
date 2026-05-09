@@ -4,6 +4,11 @@ os.environ['SPCONV_ALGO'] = 'native'        # Can be 'native' or 'auto', default
                                             # 'auto' is faster but will do benchmarking at the beginning.
                                             # Recommended to set to 'native' if run only once.
 
+# AMD/ROCm: enable AOTriton experimental attention paths used by PyTorch SDPA.
+# Must be set before `import torch`. Harmless on CUDA builds (only the ROCm
+# path reads the flag).
+os.environ.setdefault('TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL', '1')
+
 import torch
 
 # Configure torchsparse for HIP/ROCm compatibility (mirrors app.py).

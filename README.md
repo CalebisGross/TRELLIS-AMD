@@ -51,7 +51,8 @@ chmod +x install_amd.sh
 
 # Activate environment and run
 source .venv/bin/activate
-ATTN_BACKEND=sdpa XFORMERS_DISABLED=1 SPARSE_BACKEND=torchsparse python app.py
+ATTN_BACKEND=sdpa XFORMERS_DISABLED=1 SPARSE_BACKEND=torchsparse \
+  TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 python app.py
 ```
 
 Then open http://localhost:7860 in your browser.

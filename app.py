@@ -1,7 +1,12 @@
+import os
+
+# AMD/ROCm: enable AOTriton experimental attention paths used by PyTorch SDPA.
+# Must be set before `import torch`. Harmless on CUDA builds.
+os.environ.setdefault('TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL', '1')
+
 import gradio as gr
 from gradio_litmodel3d import LitModel3D
 
-import os
 import shutil
 from typing import *
 import torch
