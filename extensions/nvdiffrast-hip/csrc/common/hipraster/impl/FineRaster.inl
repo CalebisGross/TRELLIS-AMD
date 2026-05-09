@@ -54,9 +54,20 @@ __device__ __inline__ void getTriangle(const CRParams& p, S32& triIdx, S32& data
         triIdx = subtriIdx >> 3;
         dataIdx = triIdx;
         subtriIdx &= 7;
-        if (subtriIdx != 7)
-            dataIdx = triHeaderPtr[triIdx].misc + subtriIdx;
-        triHeader = *((uint4*)triHeaderPtr + dataIdx);
+        // RDNA3/ROCm 7.2 fix (matches coarseRasterImpl Bug 6): triHeaderPtr[triIdx].misc
+        // can return uninitialized garbage on AMD; guard against OOB before
+        // the indirection AND before the final uint4 read. See
+        // experiments/raster/findings.md "Bug 6".
+        if (subtriIdx != 7) {
+            if (triIdx >= 0 && triIdx < (int)p.maxSubtris)
+                dataIdx = triHeaderPtr[triIdx].misc + subtriIdx;
+            else
+                dataIdx = -1;
+        }
+        if (dataIdx >= 0 && dataIdx < (int)p.maxSubtris)
+            triHeader = *((uint4*)triHeaderPtr + dataIdx);
+        else
+            triHeader = make_uint4(0, 0, 0, 0); // safe default
     }
 
     // advance to next segment
@@ -174,18 +185,23 @@ __device__ __inline__ void executeROP(U32 color, U32 depth, volatile U32* pColor
 
 //------------------------------------------------------------------------
 
-__device__ __inline__ void fineRasterImpl(const CRParams p)
+__device__ __inline__ void fineRasterImpl(const CRParams& p, char* s_smem)
 {
-                                                                            // for 20 warps:
-    __shared__ volatile U64 s_cover8x8_lut[CR_COVER8X8_LUT_SIZE];           // 6KB
-    __shared__ volatile U32 s_tileColor   [CR_FINE_MAX_WARPS][CR_TILE_SQR]; // 5KB
-    __shared__ volatile U32 s_tileDepth   [CR_FINE_MAX_WARPS][CR_TILE_SQR]; // 5KB
-    __shared__ volatile U32 s_tilePeel    [CR_FINE_MAX_WARPS][CR_TILE_SQR]; // 5KB
-    __shared__ volatile U32 s_triDataIdx  [CR_FINE_MAX_WARPS][64];          // 5KB  CRTriangleData index
-    __shared__ volatile U64 s_triangleCov [CR_FINE_MAX_WARPS][64];          // 10KB coverage mask
-    __shared__ volatile U32 s_triangleFrag[CR_FINE_MAX_WARPS][64];          // 5KB  fragment index
-    __shared__ volatile U32 s_temp        [CR_FINE_MAX_WARPS][80];          // 6.25KB
-                                                                            // = 47.25KB total
+    // SAFE-MODE removed (Test 131). Bug 6 bounds checks applied to BOTH
+    // the getTriangle() helper (above) AND the per-fragment triData read
+    // at line ~363. fine should now run safely on data produced by the
+    // fixed coarseRaster.
+    FineSmem& smem = *(FineSmem*)s_smem;
+
+    // Alias struct members to original variable names so code below is unchanged.
+    volatile U64 (&s_cover8x8_lut)[CR_COVER8X8_LUT_SIZE] = smem.cover8x8_lut;
+    volatile U32 (&s_tileColor)[CR_FINE_MAX_WARPS][CR_TILE_SQR] = smem.tileColor;
+    volatile U32 (&s_tileDepth)[CR_FINE_MAX_WARPS][CR_TILE_SQR] = smem.tileDepth;
+    volatile U32 (&s_tilePeel)[CR_FINE_MAX_WARPS][CR_TILE_SQR] = smem.tilePeel;
+    volatile U32 (&s_triDataIdx)[CR_FINE_MAX_WARPS][64] = smem.triDataIdx;
+    volatile U64 (&s_triangleCov)[CR_FINE_MAX_WARPS][64] = smem.triangleCov;
+    volatile U32 (&s_triangleFrag)[CR_FINE_MAX_WARPS][64] = smem.triangleFrag;
+    volatile U32 (&s_temp)[CR_FINE_MAX_WARPS][80] = smem.temp;
 
     CRAtomics&            atomics   = p.atomics[blockIdx.z];
     const CRTriangleData* triData   = (const CRTriangleData*)p.triData + blockIdx.z * p.maxSubtris;
@@ -344,7 +360,15 @@ __device__ __inline__ void fineRasterImpl(const CRParams p)
 
                 // depth test
                 U32 depth = 0;
-                uint4 td = *((uint4*)triData + dataIdx * (sizeof(CRTriangleData) >> 4));
+                // Bug 6 fix (2026-05-09): dataIdx may be -1 (from getTriangle's
+                // bounds-check sentinel) when triHeader[i].misc was OOB on RDNA3.
+                // Skip the triData read in that case; treat the fragment as
+                // having maximum depth so it z-fails and gets dropped.
+                uint4 td;
+                if (dataIdx >= 0 && dataIdx < (int)p.maxSubtris)
+                    td = *((uint4*)triData + dataIdx * (sizeof(CRTriangleData) >> 4));
+                else
+                    td = make_uint4(0u, 0u, 0xFFFFFFFFu, 0u); // depth = 0xFFFFFFFF, will z-fail
 
                 depth = td.x * pixelX + td.y * pixelY + td.z;
                 bool zkill = (p.renderModeFlags & CudaRaster::RenderModeFlag_EnableDepthPeeling) && (depth <= tilePeel[pixelInTile]);

@@ -136,6 +136,14 @@ struct CRParams
     void*       activeTiles;        // CR_MAXTILES_SQR * (S32 tileIdx)
     void*       tileFirstSeg;       // CR_MAXTILES_SQR * (S32 segIdx), -1 = none
 
+    // AMD RDNA3 LDS-relief: warpEmitMask + warpEmitPrefixSum moved out of CoarseSmem
+    // into per-block global memory. One CoarseGlobalScratch slot per (image, block).
+    void*       warpEmitGlobal;     // numImages * numCoarseBlocks * sizeof(CoarseGlobalScratch)
+
+    // Diagnostic trace buffer: 64 S32 slots. Kernels atomicMax(slot[i], marker) to
+    // record the deepest checkpoint reached. Read back from host post-fault.
+    void*       debugTrace;         // 64 * sizeof(S32)
+
     // Surface buffers. Outer tile offset is baked into pointers.
 
     void*       colorBuffer;        // sizePixels.x * sizePixels.y * numImages * U32
@@ -148,6 +156,55 @@ struct CRParams
 
     CRImageParams imageParamsFirst[CR_EMBED_IMAGE_PARAMS];
     const CRImageParams* imageParamsExtra; // After CR_EMBED_IMAGE_PARAMS.
+};
+
+//------------------------------------------------------------------------
+// Shared memory layouts for CoarseRaster and FineRaster.
+// Used with extern __shared__ in the unified rasterKernel so the compiler
+// doesn't sum both allocations (AMD RDNA3 2-kernel workaround).
+//------------------------------------------------------------------------
+
+struct CoarseSmem
+{
+    volatile S32 oobCount;
+    volatile U32 workCounter;
+    volatile U32 scanTemp[CR_COARSE_WARPS][48];
+    volatile U32 binOrder[CR_MAXBINS_SQR];
+    volatile S32 binStreamCurrSeg[CR_BIN_STREAMS_SIZE];
+    volatile S32 binStreamFirstTri[CR_BIN_STREAMS_SIZE];
+    volatile S32 triQueue[CR_COARSE_QUEUE_SIZE];
+    volatile S32 triQueueWritePos;
+    volatile U32 binStreamSelectedOfs;
+    volatile U32 binStreamSelectedSize;
+    // warpEmitMask and warpEmitPrefixSum moved to CoarseGlobalScratch (per-block global memory)
+    // to relieve LDS pressure on AMD RDNA3 (~33KB savings).
+    volatile U32 tileEmitPrefixSum[CR_BIN_SQR + 1];
+    volatile U32 tileAllocPrefixSum[CR_BIN_SQR + 1];
+    volatile S32 tileStreamCurrOfs[CR_BIN_SQR];
+    volatile U32 firstAllocSeg;
+    volatile U32 firstActiveIdx;
+};
+
+// Per-block global scratch: holds the formerly-shared arrays that don't fit in
+// CoarseSmem on RDNA3. Layout MUST keep warpEmitMask immediately before
+// warpEmitPrefixSum (no padding) -- CoarseRaster.inl's binary search at the
+// "Find warp in tile" block uses pointer arithmetic that walks across both.
+struct CoarseGlobalScratch
+{
+    volatile U32 warpEmitMask[CR_COARSE_WARPS][CR_BIN_SQR + 1];
+    volatile U32 warpEmitPrefixSum[CR_COARSE_WARPS][CR_BIN_SQR + 1];
+};
+
+struct FineSmem
+{
+    volatile U64 cover8x8_lut[CR_COVER8X8_LUT_SIZE];
+    volatile U32 tileColor[CR_FINE_MAX_WARPS][CR_TILE_SQR];
+    volatile U32 tileDepth[CR_FINE_MAX_WARPS][CR_TILE_SQR];
+    volatile U32 tilePeel[CR_FINE_MAX_WARPS][CR_TILE_SQR];
+    volatile U32 triDataIdx[CR_FINE_MAX_WARPS][64];
+    volatile U64 triangleCov[CR_FINE_MAX_WARPS][64];
+    volatile U32 triangleFrag[CR_FINE_MAX_WARPS][64];
+    volatile U32 temp[CR_FINE_MAX_WARPS][80];
 };
 
 //------------------------------------------------------------------------

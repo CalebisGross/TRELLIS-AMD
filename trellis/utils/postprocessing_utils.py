@@ -43,11 +43,16 @@ def _fill_holes(
         num_views (int): Number of views to rasterize the mesh.
         verbose (bool): Whether to print progress.
     """
-    # Construct cameras
+    # Construct cameras. Hammersley pitches near +/- pi/2 put the camera
+    # directly above/below origin, making view_look_at degenerate (camera
+    # forward parallel to world-up). On AMD HIP that produces NaN clip-space
+    # verts, which hang coarseRaster forever. Pull pitches in by an epsilon.
+    pole_eps = 0.05  # radians (~3 deg)
     yaws = []
     pitchs = []
     for i in range(num_views):
         y, p = sphere_hammersley_sequence(i, num_views)
+        p = max(-np.pi / 2 + pole_eps, min(np.pi / 2 - pole_eps, p))
         yaws.append(y)
         pitchs.append(p)
     yaws = torch.tensor(yaws).cuda()
@@ -68,7 +73,7 @@ def _fill_holes(
 
     # Rasterize
     visblity = torch.zeros(faces.shape[0], dtype=torch.int32, device=verts.device)
-    rastctx = utils3d.torch.RastContext(backend='gl')  # AMD HIP FIX: use OpenGL instead of CUDA
+    rastctx = utils3d.torch.RastContext(backend='gl')
     for i in tqdm(range(views.shape[0]), total=views.shape[0], disable=not verbose, desc='Rasterizing'):
         view = views[i]
         buffers = utils3d.torch.rasterize_triangle_faces(
@@ -78,7 +83,7 @@ def _fill_holes(
         face_id = torch.unique(face_id).long()
         visblity[face_id] += 1
     visblity = visblity.float() / num_views
-    
+
     # Mincut
     ## construct outer faces
     edges, face2edge, edge_degrees = utils3d.torch.compute_edges(faces)
@@ -88,11 +93,11 @@ def _fill_holes(
     for i in range(len(connected_components)):
         outer_face_indices[connected_components[i]] = visblity[connected_components[i]] > min(max(visblity[connected_components[i]].quantile(0.75).item(), 0.25), 0.5)
     outer_face_indices = outer_face_indices.nonzero().reshape(-1)
-    
+    print(f"[fill_holes] Outer faces: {outer_face_indices.shape[0]}, connected components: {len(connected_components)}")
+
     ## construct inner faces
     inner_face_indices = torch.nonzero(visblity == 0).reshape(-1)
-    if verbose:
-        tqdm.write(f'Found {inner_face_indices.shape[0]} invisible faces')
+    print(f"[fill_holes] Inner (invisible) faces: {inner_face_indices.shape[0]}")
     if inner_face_indices.shape[0] == 0:
         return verts, faces
     
@@ -182,17 +187,16 @@ def _fill_holes(
         mask[remove_face_indices] = 0
         faces = faces[mask]
         faces, verts = utils3d.torch.remove_unreferenced_vertices(faces, verts)
-        if verbose:
-            tqdm.write(f'Removed {(~mask).sum()} faces by mincut')
+        print(f'[fill_holes] Removed {(~mask).sum().item()} faces by mincut, remaining: {faces.shape[0]} faces')
     else:
-        if verbose:
-            tqdm.write(f'Removed 0 faces by mincut')
-            
+        print(f'[fill_holes] Removed 0 faces by mincut, remaining: {faces.shape[0]} faces')
+
     mesh = _meshfix.PyTMesh()
     mesh.load_array(verts.cpu().numpy(), faces.cpu().numpy())
     mesh.fill_small_boundaries(nbe=max_hole_nbe, refine=True)
     verts, faces = mesh.return_arrays()
     verts, faces = torch.tensor(verts, device='cuda', dtype=torch.float32), torch.tensor(faces, device='cuda', dtype=torch.int32)
+    print(f'[fill_holes] After hole filling: {verts.shape[0]} verts, {faces.shape[0]} faces')
 
     return verts, faces
 
@@ -206,7 +210,7 @@ def postprocess_mesh(
     fill_holes_max_hole_size: float = 0.04,
     fill_holes_max_hole_nbe: int = 32,
     fill_holes_resolution: int = 1024,
-    fill_holes_num_views: int = 1000,
+    fill_holes_num_views: int = 100,
     debug: bool = False,
     verbose: bool = False,
 ):
@@ -306,6 +310,7 @@ def bake_texture(
         lambda_tv (float): Weight of total variation loss in optimization.
         verbose (bool): Whether to print progress.
     """
+    print(f"[bake_texture] Input: vertices={vertices.shape}, faces={faces.shape}, uvs={uvs.shape}")
     vertices = torch.tensor(vertices).cuda()
     faces = torch.tensor(faces.astype(np.int32)).cuda()
     uvs = torch.tensor(uvs).cuda()
@@ -317,7 +322,7 @@ def bake_texture(
     if mode == 'fast':
         texture = torch.zeros((texture_size * texture_size, 3), dtype=torch.float32).cuda()
         texture_weights = torch.zeros((texture_size * texture_size), dtype=torch.float32).cuda()
-        rastctx = utils3d.torch.RastContext(backend='gl')  # AMD HIP FIX: use OpenGL instead of CUDA
+        rastctx = utils3d.torch.RastContext(backend='gl')
         for observation, view, projection in tqdm(zip(observations, views, projections), total=len(observations), disable=not verbose, desc='Texture baking (fast)'):
             with torch.no_grad():
                 rast = utils3d.torch.rasterize_triangle_faces(
@@ -343,7 +348,7 @@ def bake_texture(
         texture = cv2.inpaint(texture, mask, 3, cv2.INPAINT_TELEA)
 
     elif mode == 'opt':
-        rastctx = utils3d.torch.RastContext(backend='gl')  # AMD HIP FIX: use OpenGL instead of CUDA
+        rastctx = utils3d.torch.RastContext(backend='gl')
         observations = [observations.flip(0) for observations in observations]
         masks = [m.flip(0) for m in masks]
         _uv = []
@@ -427,18 +432,15 @@ def to_glb(
     print(f"[GLB Export] Step 1/5: Mesh postprocessing (vertices={vertices.shape[0]}, faces={faces.shape[0]})...")
     
     # mesh postprocess
-    # AMD HIP FIX: Disable fill_holes because it uses rasterizer for visibility
-    # and our nvdiffrast HIP rasterizer returns empty results, causing all faces
-    # to be marked as "invisible" and removed
     vertices, faces = postprocess_mesh(
         vertices, faces,
         simplify=simplify > 0,
         simplify_ratio=simplify,
-        fill_holes=False,  # AMD HIP FIX: Disabled - rasterizer returns empty visibility
+        fill_holes=fill_holes,
         fill_holes_max_hole_size=fill_holes_max_size,
         fill_holes_max_hole_nbe=int(250 * np.sqrt(1-simplify)),
         fill_holes_resolution=1024,
-        fill_holes_num_views=1000,
+        fill_holes_num_views=100,
         debug=debug,
         verbose=verbose,
     )

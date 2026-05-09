@@ -1,7 +1,12 @@
+import os
+
+# AMD/ROCm: enable AOTriton experimental attention paths used by PyTorch SDPA.
+# Must be set before `import torch`. Harmless on CUDA builds.
+os.environ.setdefault('TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL', '1')
+
 import gradio as gr
 from gradio_litmodel3d import LitModel3D
 
-import os
 import shutil
 from typing import *
 import torch
@@ -17,7 +22,6 @@ from trellis.utils import render_utils, postprocessing_utils
 # Use GatherScatter dataflow instead of ImplicitGEMM (which requires PTX assembly)
 if os.environ.get('SPARSE_BACKEND') == 'torchsparse' and hasattr(torch.version, 'hip'):
     try:
-        import torchsparse.nn.functional as F
         from torchsparse.nn.functional.conv.conv_config import (
             Dataflow, set_global_conv_config, _default_conv_config
         )
@@ -111,7 +115,6 @@ def unpack_state(state: dict) -> Tuple[Gaussian, edict, str]:
     gs._rotation = torch.tensor(state['gaussian']['_rotation'], device='cuda')
     gs._opacity = torch.tensor(state['gaussian']['_opacity'], device='cuda')
     
-    # Handle missing mesh in gaussian-only mode
     mesh = None
     if 'mesh' in state:
         mesh = edict(
@@ -164,7 +167,7 @@ def image_to_3d(
         outputs = pipeline.run(
             image,
             seed=seed,
-            formats=["gaussian", "mesh"],  # Re-enabled mesh for testing
+            formats=["gaussian", "mesh"],
             preprocess_image=False,
             sparse_structure_sampler_params={
                 "steps": ss_sampling_steps,
@@ -179,7 +182,7 @@ def image_to_3d(
         outputs = pipeline.run_multi_image(
             [image[0] for image in multiimages],
             seed=seed,
-            formats=["gaussian", "mesh"],  # Re-enabled mesh for testing
+            formats=["gaussian", "mesh"],
             preprocess_image=False,
             sparse_structure_sampler_params={
                 "steps": ss_sampling_steps,
@@ -192,16 +195,8 @@ def image_to_3d(
             mode=multiimage_algo,
         )
     video = render_utils.render_video(outputs['gaussian'][0], num_frames=120, resolution=256)['color']
-    # Try mesh normal rendering, but skip if mesh not generated or fails on HIP/ROCm
-    if 'mesh' in outputs:
-        try:
-            video_geo = render_utils.render_video(outputs['mesh'][0], num_frames=120, resolution=256)['normal']
-            video = [np.concatenate([video[i], video_geo[i]], axis=1) for i in range(len(video))]
-        except Exception as e:
-            print(f"[HIP] Mesh normal rendering failed (nvdiffrast issue), showing Gaussian only: {e}")
-            pass
-    else:
-        print("[HIP] Skipping mesh rendering (gaussian-only mode for AMD GPU)")
+    video_geo = render_utils.render_video(outputs['mesh'][0], num_frames=120, resolution=256)['normal']
+    video = [np.concatenate([video[i], video_geo[i]], axis=1) for i in range(len(video))]
     video_path = os.path.join(user_dir, 'sample.mp4')
     imageio.mimsave(video_path, video, fps=15)
     mesh_output = outputs['mesh'][0] if 'mesh' in outputs else None
@@ -230,11 +225,10 @@ def extract_glb(
     user_dir = os.path.join(TMP_DIR, str(req.session_hash))
     gs, mesh = unpack_state(state)
     
-    # Check if mesh is available (not in gaussian-only mode)
     if mesh is None:
-        raise gr.Error("GLB extraction requires mesh data. Re-run with mesh generation enabled (not available on AMD GPU currently).")
+        raise gr.Error("GLB extraction requires mesh data. Re-run with mesh generation enabled.")
     
-    glb = postprocessing_utils.to_glb(gs, mesh, simplify=mesh_simplify, texture_size=texture_size, verbose=False)
+    glb = postprocessing_utils.to_glb(gs, mesh, simplify=mesh_simplify, texture_size=texture_size, verbose=True)
     glb_path = os.path.join(user_dir, 'sample.glb')
     glb.export(glb_path)
     torch.cuda.empty_cache()

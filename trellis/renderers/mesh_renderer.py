@@ -39,7 +39,7 @@ class MeshRenderer:
 
     Args:
         rendering_options (dict): Rendering options.
-        glctx (nvdiffrast.torch.RasterizeGLContext): RasterizeGLContext object for CUDA/OpenGL interop.
+        glctx (nvdiffrast.torch.RasterizeCudaContext): rasterizer context.
         """
     def __init__(self, rendering_options={}, device='cuda'):
         self.rendering_options = edict({
@@ -49,7 +49,7 @@ class MeshRenderer:
             "ssaa": 1
         })
         self.rendering_options.update(rendering_options)
-        self.glctx = dr.RasterizeGLContext(device=device)  # AMD HIP FIX: use OpenGL instead of CUDA
+        self.glctx = dr.RasterizeCudaContext(device=device)
         self.device=device
         
     def render(

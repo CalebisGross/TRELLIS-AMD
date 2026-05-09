@@ -2,7 +2,13 @@
 
 **TRELLIS running on AMD GPUs with ROCm** - Image to 3D Asset Generation
 
-This is a fork of [Microsoft TRELLIS](https://github.com/microsoft/TRELLIS) modified to run on AMD consumer GPUs (tested on RX 7800 XT with ROCm 6.4.2).
+This is a fork of [Microsoft TRELLIS](https://github.com/microsoft/TRELLIS) modified to run on AMD consumer GPUs (tested on RX 7800 XT with ROCm 7.2.1, torch 2.10.0+rocm7.0).
+
+> **Status (May 2026): Fully operational on RX 7800 XT.** Tested end-to-end:
+> image → 3D asset → textured GLB, including mesh rendering, hole filling, and
+> texture baking on a 16 GB consumer card. The multi-month rasterizer
+> investigation that unblocked this is documented in
+> [experiments/raster/](experiments/raster/).
 
 ## Features
 
@@ -18,10 +24,10 @@ This is a fork of [Microsoft TRELLIS](https://github.com/microsoft/TRELLIS) modi
 
 ## Requirements
 
-- AMD GPU (tested: RX 7800 XT, RDNA3)
-- ROCm 6.4+ 
+- AMD GPU (tested: RX 7800 XT, RDNA3 / gfx1101)
+- ROCm 7.0+ (tested on system ROCm 7.2.1, torch 2.10.0+rocm7.0)
 - Python 3.10+
-- ~16GB VRAM recommended
+- 16 GB VRAM (the pipeline is split into staged phases to fit; see [example.py](example.py))
 
 ## Quick Start
 
@@ -51,7 +57,8 @@ chmod +x install_amd.sh
 
 # Activate environment and run
 source .venv/bin/activate
-ATTN_BACKEND=sdpa XFORMERS_DISABLED=1 SPARSE_BACKEND=torchsparse python app.py
+ATTN_BACKEND=sdpa XFORMERS_DISABLED=1 SPARSE_BACKEND=torchsparse \
+  TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 python app.py
 ```
 
 Then open http://localhost:7860 in your browser.
@@ -67,9 +74,14 @@ Then open http://localhost:7860 in your browser.
 | **torchsparse** | Built with `FORCE_CUDA=1` for HIP GPU backend |
 
 ### Application Modifications
-- Switched to OpenGL rasterization backend (avoids HIP rasterizer bugs)
-- Disabled `fill_holes` in mesh postprocessing (avoids visibility check issues)
+- HIP rasterizer (CoarseRaster + FineRaster) bounds-check fix for the
+  `triHeader[i].misc` OOB on RDNA3 — see [experiments/raster/findings.md](experiments/raster/findings.md#bug-6--triheaderimisc-oob-on-rdna3-resolved-2026-05-09)
+- `_fill_holes` pole-clamps the Hammersley camera distribution so views
+  directly above/below the mesh don't NaN `view_look_at` and hang
+  coarseRaster (default num_views also dropped 1000 → 100 for speed)
 - Added progress logging for GLB export
+- `example.py` splits the pipeline into staged phases, moving idle
+  submodels to CPU between phases so the full run fits in 16 GB VRAM
 
 ## Processing Time Reference
 
@@ -92,17 +104,28 @@ The GLB export shows progress in console:
 
 ## Known Limitations
 
-1. **Mesh Preview**: May show grey - the actual export works correctly
-2. **fill_holes Disabled**: Small holes in meshes may not be filled
-3. **Performance**: Simplified coarse rasterizer is slower than NVIDIA-optimized version
+1. **Performance**: Coarse rasterizer is serialized and slower than NVIDIA's warp-parallel version
+2. **~7% silent triangle culls**: The Bug 6 bounds-check fix culls triangles
+   with an out-of-range `triHeader[i].misc` from triangleSetup. Visual impact
+   is small but the underlying invariant violation is unresolved. See
+   [experiments/raster/findings.md](experiments/raster/findings.md#bug-6--triheaderimisc-oob-on-rdna3-resolved-2026-05-09)
+   for the Phase C root-cause hypothesis.
+3. **fill_holes uses 100 views, not 1000**: TRELLIS upstream rasterizes 1000
+   Hammersley-distributed views to detect invisible faces. We clamp views
+   away from the world-up poles (otherwise the HIP rasterizer hangs on
+   degenerate view matrices) and use 100 views. Hole detection quality is
+   visually indistinguishable, and step 1 of GLB extract is now ~10x faster.
 
 ## Troubleshooting
 
 ### GPU Hang/Crash
-Ensure you're using ROCm 6.4+ and PyTorch built for ROCm.
+Ensure you're using ROCm 7.0+ and PyTorch built for ROCm (torch 2.10.0+rocm7.0
+or newer is recommended).
 
 ### Empty Mesh
-Check that `fill_holes=False` is set in `trellis/utils/postprocessing_utils.py`.
+Confirm the input image actually has a foreground subject after rembg
+background removal. If so, raise the `Mesh Simplify` slider toward 0 in
+the UI to keep more triangles, or pass `simplify=0.0` to `to_glb()`.
 
 ### CUDA Symbol Errors  
 Make sure you're using the AMD-modified extensions in this repo, not the original CUDA ones.

@@ -179,7 +179,7 @@ __device__ __inline__ void setupTriangle(
 
 //------------------------------------------------------------------------
 
-__device__ __inline__ void triangleSetupImpl(const CRParams p)
+__device__ __inline__ void triangleSetupImpl(const CRParams& p)
 {
     __shared__ F32 s_bary[CR_SETUP_WARPS * 32][18];
     F32* bary = s_bary[threadIdx.x + threadIdx.y * 32];

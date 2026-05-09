@@ -17,37 +17,40 @@ __device__ __inline__ int globalTileIdx(int tileInBin, int widthTiles) {
 
 //------------------------------------------------------------------------
 
-__device__ __inline__ void coarseRasterImpl(const CRParams p) {
-  // Common.
+__device__ __inline__ void coarseRasterImpl(const CRParams& p, char* s_smem) {
+  // SAFE-MODE removed 2026-05-09 (Test 127). Bug 6 (triHeader[i].misc OOB)
+  // fixed via bounds checks at the triHeader read site (~line 311).
+  // Diagnostic checkpoint markers + Test 42 OOB checks remain below.
+  S32* dbg = (S32*)p.debugTrace;
+  if (dbg) atomicMax(dbg, 1);
+  CoarseSmem& smem = *(CoarseSmem*)s_smem;
 
-  __shared__ volatile U32 s_workCounter;
-  __shared__ volatile U32 s_scanTemp[CR_COARSE_WARPS][48]; // 3KB
+  // AMD RDNA3 LDS-relief: warpEmitMask + warpEmitPrefixSum live in per-block
+  // global memory. One CoarseGlobalScratch slot per (image, block).
+  // Pointer-arithmetic binary search at "Find warp in tile" requires these two
+  // arrays be contiguous in memory (no padding) -- preserved by struct layout.
+  CoarseGlobalScratch* gscratch =
+      ((CoarseGlobalScratch*)p.warpEmitGlobal) + blockIdx.x +
+      gridDim.x * blockIdx.z;
 
-  // Input.
-
-  __shared__ volatile U32 s_binOrder[CR_MAXBINS_SQR];               // 1KB
-  __shared__ volatile S32 s_binStreamCurrSeg[CR_BIN_STREAMS_SIZE];  // 0KB
-  __shared__ volatile S32 s_binStreamFirstTri[CR_BIN_STREAMS_SIZE]; // 0KB
-  __shared__ volatile S32 s_triQueue[CR_COARSE_QUEUE_SIZE];         // 4KB
-  __shared__ volatile S32 s_triQueueWritePos;
-  __shared__ volatile U32 s_binStreamSelectedOfs;
-  __shared__ volatile U32 s_binStreamSelectedSize;
-
-  // Output.
-
-  __shared__ volatile U32
-      s_warpEmitMask[CR_COARSE_WARPS]
-                    [CR_BIN_SQR + 1]; // 16KB, +1 to avoid bank collisions
-  __shared__ volatile U32
-      s_warpEmitPrefixSum[CR_COARSE_WARPS]
-                         [CR_BIN_SQR + 1]; // 16KB, +1 to avoid bank collisions
-  __shared__ volatile U32
-      s_tileEmitPrefixSum[CR_BIN_SQR + 1]; // 1KB, zero at the beginning
-  __shared__ volatile U32
-      s_tileAllocPrefixSum[CR_BIN_SQR + 1]; // 1KB, zero at the beginning
-  __shared__ volatile S32 s_tileStreamCurrOfs[CR_BIN_SQR]; // 1KB
-  __shared__ volatile U32 s_firstAllocSeg;
-  __shared__ volatile U32 s_firstActiveIdx;
+  // Alias struct members to original variable names so code below is unchanged.
+  volatile S32& s_oobCount = smem.oobCount;
+  volatile U32& s_workCounter = smem.workCounter;
+  volatile U32 (&s_scanTemp)[CR_COARSE_WARPS][48] = smem.scanTemp;
+  volatile U32 (&s_binOrder)[CR_MAXBINS_SQR] = smem.binOrder;
+  volatile S32 (&s_binStreamCurrSeg)[CR_BIN_STREAMS_SIZE] = smem.binStreamCurrSeg;
+  volatile S32 (&s_binStreamFirstTri)[CR_BIN_STREAMS_SIZE] = smem.binStreamFirstTri;
+  volatile S32 (&s_triQueue)[CR_COARSE_QUEUE_SIZE] = smem.triQueue;
+  volatile S32& s_triQueueWritePos = smem.triQueueWritePos;
+  volatile U32& s_binStreamSelectedOfs = smem.binStreamSelectedOfs;
+  volatile U32& s_binStreamSelectedSize = smem.binStreamSelectedSize;
+  volatile U32 (&s_warpEmitMask)[CR_COARSE_WARPS][CR_BIN_SQR + 1] = gscratch->warpEmitMask;
+  volatile U32 (&s_warpEmitPrefixSum)[CR_COARSE_WARPS][CR_BIN_SQR + 1] = gscratch->warpEmitPrefixSum;
+  volatile U32 (&s_tileEmitPrefixSum)[CR_BIN_SQR + 1] = smem.tileEmitPrefixSum;
+  volatile U32 (&s_tileAllocPrefixSum)[CR_BIN_SQR + 1] = smem.tileAllocPrefixSum;
+  volatile S32 (&s_tileStreamCurrOfs)[CR_BIN_SQR] = smem.tileStreamCurrOfs;
+  volatile U32& s_firstAllocSeg = smem.firstAllocSeg;
+  volatile U32& s_firstActiveIdx = smem.firstActiveIdx;
 
   // Pointers and constants.
 
@@ -76,16 +79,31 @@ __device__ __inline__ void coarseRasterImpl(const CRParams p) {
       CR_BIN_LOG2 * 2 +
       5; // We scan ((numEmits << emitShift) | numAllocs) over tiles.
 
+  // CHECKPOINT 2: pointer & gscratch setup complete.
+  if (dbg) atomicMax(dbg, 2);
+
   if (atomics.numSubtris > p.maxSubtris || atomics.numBinSegs > p.maxBinSegs)
     return;
+
+  // Test 42: bounds limit for tile segment writes.
+  int maxTileSegOfs = p.maxTileSegs * CR_TILE_SEG_SIZE;
+
+  // CHECKPOINT 3: passed early-out check.
+  if (dbg) atomicMax(dbg, 3);
 
   // Initialize sharedmem arrays.
 
   if (thrInBlock == 0) {
     s_tileEmitPrefixSum[0] = 0;
     s_tileAllocPrefixSum[0] = 0;
+#if CR_DEBUG_OOB
+    s_oobCount = 0;
+#endif
   }
   s_scanTemp[threadIdx.y][threadIdx.x] = 0;
+
+  // CHECKPOINT 4: smem init done.
+  if (dbg) atomicMax(dbg, 4);
 
   // Sort bins in descending order of triangle count.
   // AMD HIP FIX: Skip sorting - just use natural bin order
@@ -102,9 +120,14 @@ __device__ __inline__ void coarseRasterImpl(const CRParams p) {
   // AMD HIP FIX: sortShared commented out - causes deadlock on AMD
   // sortShared(s_binOrder, p.numBins);
 
+  // CHECKPOINT 5: binOrder init done, entering main bin loop.
+  if (dbg) atomicMax(dbg, 5);
+
   // Process each bin by one block.
 
   for (;;) {
+    // CHECKPOINT 6: bin loop iter start.
+    if (dbg) atomicMax(dbg, 6);
     // Pick a bin for the block.
 
     if (thrInBlock == 0)
@@ -127,6 +150,9 @@ __device__ __inline__ void coarseRasterImpl(const CRParams p) {
     bool binEmpty = (triCount == 0);
     if (binEmpty && !p.deferredClear)
       continue; // Skip empty bins instead of break
+
+    // CHECKPOINT 7: passed binEmpty check (non-empty bin found).
+    if (dbg) atomicMax(dbg, 7);
 
     // Initialize input/output streams.
 
@@ -158,10 +184,15 @@ __device__ __inline__ void coarseRasterImpl(const CRParams p) {
         ::min(p.heightTiles - (binY << CR_BIN_LOG2), CR_BIN_SIZE) - 1;
     int binTileIdx = (binX + binY * p.widthTiles) << CR_BIN_LOG2;
 
+    // CHECKPOINT 8: stream init complete, entering merge do-while.
+    if (dbg) atomicMax(dbg, 8);
+
     // Entire block: Merge input streams and process triangles.
 
     if (!binEmpty)
       do {
+        // CHECKPOINT 9: merge do-while iter start.
+        if (dbg) atomicMax(dbg, 9);
         //------------------------------------------------------------------------
         // Merge.
         //------------------------------------------------------------------------
@@ -282,9 +313,24 @@ __device__ __inline__ void coarseRasterImpl(const CRParams p) {
         if (triIdx != -1) {
           int dataIdx = triIdx >> 3;
           int subtriIdx = triIdx & 7;
-          if (subtriIdx != 7)
-            dataIdx = triHeader[dataIdx].misc + subtriIdx;
-          triData = *((uint4 *)triHeader + dataIdx);
+          // RDNA3/ROCm 7.2 fix (2026-05-09 Tests 123-126): triHeader[i].misc
+          // can return uninitialized garbage on RDNA3 (observed value
+          // 4138327560 = 0xF6A4_18B8 for triIdx=0, ~7% of active threads
+          // affected per icosphere mesh). The original NVIDIA code assumed
+          // triangleSetup writes a valid .misc for every entry that ends
+          // up in binSegData; on AMD, that invariant breaks and the
+          // resulting OOB triHeader[dataIdx] read faults the GPU
+          // (hipErrorIllegalAddress). Bounds-check both reads. Threads
+          // with bad indices skip this triangle — equivalent to it being
+          // culled, which is the safe behavior.
+          if (subtriIdx != 7) {
+            if (dataIdx >= 0 && dataIdx < (int)p.maxSubtris)
+              dataIdx = triHeader[dataIdx].misc + subtriIdx;
+            else
+              dataIdx = -1;
+          }
+          if (dataIdx >= 0 && dataIdx < (int)p.maxSubtris)
+            triData = *((uint4 *)triHeader + dataIdx);
         }
 
         // 32 triangles per warp: Record emits (= tile intersections).
@@ -726,7 +772,15 @@ __device__ __inline__ void coarseRasterImpl(const CRParams p) {
           int triIdx = s_triQueue[(triQueueReadPos + queueIdx) &
                                   (CR_COARSE_QUEUE_SIZE - 1)];
 
-          tileSegData[outOfs] = triIdx;
+          // Test 42: bounds check tileSegData write.
+          if (outOfs >= 0 && outOfs < maxTileSegOfs)
+            tileSegData[outOfs] = triIdx;
+#if CR_DEBUG_OOB
+          else if (atomicAdd((S32*)&s_oobCount, 1) < 4)
+            printf("[OOB-A] outOfs=%d max=%d tile=%d emit=%d currOfs=%d spaceLeft=%d allocLo=%d firstAlloc=%d\n",
+                   outOfs, maxTileSegOfs, tileInBin, emitInTile, currOfs, spaceLeft,
+                   firstAllocSeg + (int)s_tileAllocPrefixSum[tileInBin], firstAllocSeg);
+#endif
         }
 
         //------------------------------------------------------------------------
@@ -738,8 +792,16 @@ __device__ __inline__ void coarseRasterImpl(const CRParams p) {
         for (int i = CR_COARSE_WARPS * 32 - 1 - thrInBlock; i < totalAllocs;
              i += CR_COARSE_WARPS * 32) {
           int segIdx = firstAllocSeg + i;
-          tileSegNext[segIdx] = segIdx + 1;
-          tileSegCount[segIdx] = CR_TILE_SEG_SIZE;
+          // Test 42: bounds check tileSegNext/Count write.
+          if (segIdx >= 0 && segIdx < p.maxTileSegs) {
+            tileSegNext[segIdx] = segIdx + 1;
+            tileSegCount[segIdx] = CR_TILE_SEG_SIZE;
+          }
+#if CR_DEBUG_OOB
+          else if (atomicAdd((S32*)&s_oobCount, 1) < 4)
+            printf("[OOB-B] segIdx=%d max=%d i=%d firstAlloc=%d totalAllocs=%d\n",
+                   segIdx, p.maxTileSegs, i, firstAllocSeg, totalAllocs);
+#endif
         }
 
         // Tile per thread: Fix previous segment's next-pointer and update
@@ -755,11 +817,19 @@ __device__ __inline__ void coarseRasterImpl(const CRParams p) {
           int allocHi = s_tileAllocPrefixSum[tileInBin + 1];
 
           if (allocLo != allocHi) {
-            S32 *nextPtr = &tileSegNext[(oldOfs - 1) >> CR_TILE_SEG_LOG2];
-            if (oldOfs < 0)
-              nextPtr = &tileFirstSeg[binTileIdx +
-                                      globalTileIdx(tileInBin, p.widthTiles)];
-            *nextPtr = firstAllocSeg + allocLo;
+            // Test 42: bounds check nextPtr write.
+            if (oldOfs <= 0) {
+              tileFirstSeg[binTileIdx + globalTileIdx(tileInBin, p.widthTiles)] = firstAllocSeg + allocLo;
+            } else {
+              int nextSegIdx = (oldOfs - 1) >> CR_TILE_SEG_LOG2;
+              if (nextSegIdx >= 0 && nextSegIdx < p.maxTileSegs)
+                tileSegNext[nextSegIdx] = firstAllocSeg + allocLo;
+#if CR_DEBUG_OOB
+              else if (atomicAdd((S32*)&s_oobCount, 1) < 4)
+                printf("[OOB-C] nextSegIdx=%d max=%d oldOfs=%d tileInBin=%d allocLo=%d\n",
+                       nextSegIdx, p.maxTileSegs, oldOfs, tileInBin, allocLo);
+#endif
+            }
 
             newOfs--;
             newOfs &= CR_TILE_SEG_SIZE - 1;
@@ -795,15 +865,30 @@ __device__ __inline__ void coarseRasterImpl(const CRParams p) {
         int segIdx = (ofs - 1) >> CR_TILE_SEG_LOG2;
         int segCount = ofs & (CR_TILE_SEG_SIZE - 1);
 
-        if (ofs >= 0)
-          tileSegNext[segIdx] = -1;
-        else if (force) {
+        if (ofs >= 0) {
+          // Test 42: bounds check tileSegNext finalize write.
+          if (segIdx >= 0 && segIdx < p.maxTileSegs)
+            tileSegNext[segIdx] = -1;
+#if CR_DEBUG_OOB
+          else if (atomicAdd((S32*)&s_oobCount, 1) < 4)
+            printf("[OOB-D] segIdx=%d max=%d ofs=%d tileInBin=%d\n",
+                   segIdx, p.maxTileSegs, ofs, tileInBin);
+#endif
+        } else if (force) {
           s_tileStreamCurrOfs[tileInBin] = 0;
           tileFirstSeg[binTileIdx + tileX + tileY * p.widthTiles] = -1;
         }
 
-        if (segCount != 0)
-          tileSegCount[segIdx] = segCount;
+        if (segCount != 0) {
+          // Test 42: bounds check tileSegCount finalize write.
+          if (segIdx >= 0 && segIdx < p.maxTileSegs)
+            tileSegCount[segIdx] = segCount;
+#if CR_DEBUG_OOB
+          else if (atomicAdd((S32*)&s_oobCount, 1) < 4)
+            printf("[OOB-E] segIdx=%d max=%d ofs=%d segCount=%d tileInBin=%d\n",
+                   segIdx, p.maxTileSegs, ofs, segCount, tileInBin);
+#endif
+        }
 
         U32 res = __ballot_sync(actMask, ofs >= 0 | force);
         if (threadIdx.x == 0)

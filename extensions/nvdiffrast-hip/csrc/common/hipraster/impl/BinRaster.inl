@@ -9,7 +9,7 @@
 
 //------------------------------------------------------------------------
 
-__device__ __inline__ void binRasterImpl(const CRParams p)
+__device__ __inline__ void binRasterImpl(const CRParams& p)
 {
     __shared__ volatile U32 s_broadcast [CR_BIN_WARPS + 16];
     __shared__ volatile S32 s_outOfs    [CR_MAXBINS_SQR];

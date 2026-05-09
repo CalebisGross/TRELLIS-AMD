@@ -34,8 +34,16 @@
 #define CR_SETUP_WARPS          2
 #define CR_SETUP_OPT_BLOCKS     8
 #define CR_BIN_WARPS            16
-#define CR_COARSE_WARPS         16      // Must be a power of two.
-#define CR_FINE_MAX_WARPS       20
+#define CR_COARSE_WARPS         8
+#define CR_FINE_MAX_WARPS       12
+
+// When 1, coarseRaster emits printf-based OOB diagnostics. These were
+// useful during Test 42's bounds-check investigation but pull in the
+// device-side __ockl_printf hostcall machinery, which inflates VGPR
+// usage from ~169 to ~202 and grows the kernarg size by 256 bytes.
+// On RDNA3 the result was hipErrorLaunchOutOfResources (719). Keep at
+// 0 in normal builds; flip to 1 only when you actually want the dumps.
+#define CR_DEBUG_OOB            0
 
 #define CR_EMBED_IMAGE_PARAMS   32      // Number of per-image parameter structs embedded in kernel launch parameter block.
 
