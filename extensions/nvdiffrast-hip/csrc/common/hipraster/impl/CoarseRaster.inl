@@ -96,7 +96,9 @@ __device__ __inline__ void coarseRasterImpl(const CRParams& p, char* s_smem) {
   if (thrInBlock == 0) {
     s_tileEmitPrefixSum[0] = 0;
     s_tileAllocPrefixSum[0] = 0;
+#if CR_DEBUG_OOB
     s_oobCount = 0;
+#endif
   }
   s_scanTemp[threadIdx.y][threadIdx.x] = 0;
 
@@ -773,10 +775,12 @@ __device__ __inline__ void coarseRasterImpl(const CRParams& p, char* s_smem) {
           // Test 42: bounds check tileSegData write.
           if (outOfs >= 0 && outOfs < maxTileSegOfs)
             tileSegData[outOfs] = triIdx;
+#if CR_DEBUG_OOB
           else if (atomicAdd((S32*)&s_oobCount, 1) < 4)
             printf("[OOB-A] outOfs=%d max=%d tile=%d emit=%d currOfs=%d spaceLeft=%d allocLo=%d firstAlloc=%d\n",
                    outOfs, maxTileSegOfs, tileInBin, emitInTile, currOfs, spaceLeft,
                    firstAllocSeg + (int)s_tileAllocPrefixSum[tileInBin], firstAllocSeg);
+#endif
         }
 
         //------------------------------------------------------------------------
@@ -792,9 +796,12 @@ __device__ __inline__ void coarseRasterImpl(const CRParams& p, char* s_smem) {
           if (segIdx >= 0 && segIdx < p.maxTileSegs) {
             tileSegNext[segIdx] = segIdx + 1;
             tileSegCount[segIdx] = CR_TILE_SEG_SIZE;
-          } else if (atomicAdd((S32*)&s_oobCount, 1) < 4)
+          }
+#if CR_DEBUG_OOB
+          else if (atomicAdd((S32*)&s_oobCount, 1) < 4)
             printf("[OOB-B] segIdx=%d max=%d i=%d firstAlloc=%d totalAllocs=%d\n",
                    segIdx, p.maxTileSegs, i, firstAllocSeg, totalAllocs);
+#endif
         }
 
         // Tile per thread: Fix previous segment's next-pointer and update
@@ -817,9 +824,11 @@ __device__ __inline__ void coarseRasterImpl(const CRParams& p, char* s_smem) {
               int nextSegIdx = (oldOfs - 1) >> CR_TILE_SEG_LOG2;
               if (nextSegIdx >= 0 && nextSegIdx < p.maxTileSegs)
                 tileSegNext[nextSegIdx] = firstAllocSeg + allocLo;
+#if CR_DEBUG_OOB
               else if (atomicAdd((S32*)&s_oobCount, 1) < 4)
                 printf("[OOB-C] nextSegIdx=%d max=%d oldOfs=%d tileInBin=%d allocLo=%d\n",
                        nextSegIdx, p.maxTileSegs, oldOfs, tileInBin, allocLo);
+#endif
             }
 
             newOfs--;
@@ -860,9 +869,11 @@ __device__ __inline__ void coarseRasterImpl(const CRParams& p, char* s_smem) {
           // Test 42: bounds check tileSegNext finalize write.
           if (segIdx >= 0 && segIdx < p.maxTileSegs)
             tileSegNext[segIdx] = -1;
+#if CR_DEBUG_OOB
           else if (atomicAdd((S32*)&s_oobCount, 1) < 4)
             printf("[OOB-D] segIdx=%d max=%d ofs=%d tileInBin=%d\n",
                    segIdx, p.maxTileSegs, ofs, tileInBin);
+#endif
         } else if (force) {
           s_tileStreamCurrOfs[tileInBin] = 0;
           tileFirstSeg[binTileIdx + tileX + tileY * p.widthTiles] = -1;
@@ -872,9 +883,11 @@ __device__ __inline__ void coarseRasterImpl(const CRParams& p, char* s_smem) {
           // Test 42: bounds check tileSegCount finalize write.
           if (segIdx >= 0 && segIdx < p.maxTileSegs)
             tileSegCount[segIdx] = segCount;
+#if CR_DEBUG_OOB
           else if (atomicAdd((S32*)&s_oobCount, 1) < 4)
             printf("[OOB-E] segIdx=%d max=%d ofs=%d segCount=%d tileInBin=%d\n",
                    segIdx, p.maxTileSegs, ofs, segCount, tileInBin);
+#endif
         }
 
         U32 res = __ballot_sync(actMask, ofs >= 0 | force);
