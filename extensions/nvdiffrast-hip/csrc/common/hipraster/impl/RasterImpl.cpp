@@ -470,13 +470,14 @@ void RasterImpl::launchStages(bool instanceMode, bool peel,
         sizeof(CRAtomics) * m_numImages, hipMemcpyDeviceToHost, stream));
   }
 
-  // Print diagnostic trace BEFORE sync. Host-pinned memory means kernel writes
-  // are visible via PCIe immediately. If sync triggers SIGABRT from a GPU fault,
-  // we still got the trace.
+#if CR_DEBUG_OOB
+  // Bisect-era diagnostic: print the deepest checkpoint reached by the kernel
+  // before the post-launch sync, in case the sync itself raises a fault.
+  // Host-pinned memory means kernel writes are visible via PCIe immediately.
+  // Off in normal builds — flip CR_DEBUG_OOB if you need it. (Bug 6 leftover.)
   if (stageSet == 1) {
     S32* trace = (S32*)m_debugTrace.getPtr();
     if (trace) {
-      // Brief poll: give the kernel a moment to make progress / fault.
       for (int i = 0; i < 50; i++) {
         if (trace[0] > 0) break;
         usleep(10000); // 10ms x 50 = up to 500ms
@@ -485,6 +486,7 @@ void RasterImpl::launchStages(bool instanceMode, bool peel,
       std::cerr.flush();
     }
   }
+#endif
   NVDR_CHECK_CUDA_ERROR(hipStreamSynchronize(stream));
 }
 
